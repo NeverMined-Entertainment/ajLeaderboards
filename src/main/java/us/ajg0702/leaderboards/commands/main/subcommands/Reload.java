@@ -43,7 +43,7 @@ public class Reload extends SubCommand {
             plugin.reloadInterval();
             Debug.setDebug(plugin.getAConfig().getBoolean("debug"));
             Debug.setParticles(plugin.getAConfig().getBoolean("particles"));
-            TimeUtils.setStrings(plugin.getMessages());
+            TimeUtils.setFormat(plugin.getMessages().getRawString("time.format"));
         } catch (ConfigurateException e) {
             plugin.getLogger().log(Level.WARNING, "Unable to reload the config:", e);
             sender.sendMessage(plugin.getMessages().getComponent("commands.reload.fail"));

@@ -154,7 +154,7 @@ public class LeaderboardPlugin extends JavaPlugin {
         }
 
 
-        TimeUtils.setStrings(messages);
+        TimeUtils.setFormat(messages.getRawString("time.format"));
 
         getScheduler().runTaskAsynchronously(() -> {
             if(Bukkit.getPluginManager().isPluginEnabled("Vault")) {

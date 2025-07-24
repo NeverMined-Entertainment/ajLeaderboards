@@ -30,11 +30,7 @@ public class MessageLoader {
                 "formatted.d", "d",
                 "formatted.ud", "ud",
 
-                "time.w", "w ",
-                "time.d", "d ",
-                "time.h", "h ",
-                "time.m", "m ",
-                "time.s", "s",
+                "time.format", "HH'h:'mm'm:'ss's'",
 
                 "noperm", "You don't have permission to do this!",
 
