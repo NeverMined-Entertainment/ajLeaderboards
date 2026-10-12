@@ -7,11 +7,12 @@ import us.ajg0702.leaderboards.LeaderboardPlugin;
 
 import javax.annotation.Nullable;
 import java.util.*;
+import java.util.concurrent.ConcurrentLinkedDeque;
 
 import static us.ajg0702.leaderboards.LeaderboardPlugin.message;
 
 public class OfflineUpdater {
-    private final Deque<OfflinePlayer> offlinePlayerQueue = new ArrayDeque<>();
+    private final Deque<OfflinePlayer> offlinePlayerQueue = new ConcurrentLinkedDeque<>();
     private final LeaderboardPlugin plugin;
     private final CommandSender reportTo;
     private final int started;
@@ -47,7 +48,8 @@ public class OfflineUpdater {
         });
     }
     public double getProgressPercent() {
-        return offlinePlayerQueue.size() / ((double) started);
+        if (started == 0) return 1; // No players started, avoid division by zero
+        return (started - offlinePlayerQueue.size()) / ((double) started);
     }
     public int getRemainingPlayers() {
         return offlinePlayerQueue.size();

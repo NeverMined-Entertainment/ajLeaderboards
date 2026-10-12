@@ -16,10 +16,14 @@ public class SqliteMethod implements CacheMethod {
     private LeaderboardPlugin plugin;
     private ConfigFile config;
     private Cache cacheInstance;
+    private boolean initialized = false;
     @Override
-    public Connection getConnection() {
+    public Connection getConnection() throws SQLException {
+        if (!initialized) {
+            throw new SQLException("SqliteMethod not initialized");
+        }
         try {
-            if(conn.isClosed()) {
+            if(conn == null || conn.isClosed()) {
                 plugin.getLogger().warning("Sqlite connection is dead, making a new one");
                 init(plugin, config, cacheInstance);
             }
@@ -47,6 +51,7 @@ public class SqliteMethod implements CacheMethod {
         String url = "jdbc:sqlite:"+plugin.getDataFolder().getAbsolutePath()+ File.separator+"cache.db";
         try {
             conn = DriverManager.getConnection(url);
+            initialized = true;
         } catch (SQLException e) {
             plugin.getLogger().severe("Unnable to create cache file! The plugin will not work correctly!");
             e.printStackTrace();
@@ -103,7 +108,8 @@ public class SqliteMethod implements CacheMethod {
                 version = 5;
             }
         } catch (SQLException e) {
-            if(e.getMessage().contains("duplicate column name")) {
+            String message = e.getMessage();
+            if(message != null && message.contains("duplicate column name")) {
                 try(Statement statement = conn.createStatement()) {
                     statement.executeUpdate("PRAGMA user_version = 5;");
                 } catch (SQLException ex) {

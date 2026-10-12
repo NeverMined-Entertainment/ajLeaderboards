@@ -34,10 +34,10 @@ public class RelExtra extends Placeholder {
         if(!r.hasPlayer()) {
             return plugin.getMessages().getRawString("no-data.rel.value");
         }
-        String value = plugin.getTopManager().getExtra(r.getPlayerID(), matcher.group(4));
+        String value = plugin.getTopManager().getExtra(r.getPlayerID(), matcher.group(5));
         if(value == null) {
             // We only check if the extra is valid here because we want to support synced servers only gathering extras from a certain server
-            if(!plugin.getExtraManager().isExtra(matcher.group(4))) {
+            if(!plugin.getExtraManager().isExtra(matcher.group(5))) {
                 return "Extra does not exist";
             }
             return plugin.getMessages().getRawString("no-data.rel.value");

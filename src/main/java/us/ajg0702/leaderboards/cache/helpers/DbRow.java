@@ -7,6 +7,7 @@ import us.ajg0702.leaderboards.utils.EasyJsonObject;
 import java.sql.ResultSet;
 import java.sql.SQLException;
 import java.util.*;
+import java.util.concurrent.ConcurrentHashMap;
 
 public class DbRow {
 
@@ -24,7 +25,7 @@ public class DbRow {
 
 
 
-    private static final Map<String, Integer> positionCache = new HashMap<>();
+    private static final Map<String, Integer> positionCache = new ConcurrentHashMap<>();
     public DbRow(ResultSet resultSet) throws SQLException {
         this(
                 UUID.fromString(resultSet.getString(getIndex(resultSet, "id"))),
@@ -84,12 +85,17 @@ public class DbRow {
     }
 
     private static int getIndex(ResultSet rs, String name) throws SQLException {
-        if(!positionCache.containsKey(name)) {
-            int position = rs.findColumn(name);
-            positionCache.put(name, position);
-            return position;
+        Integer index = positionCache.get(name);
+        if (index != null) {
+            return index;
         }
-        return positionCache.get(name);
+        try {
+            int position = rs.findColumn(name);
+            Integer existing = positionCache.putIfAbsent(name, position);
+            return existing != null ? existing : position;
+        } catch (SQLException e) {
+            throw new RuntimeException(e);
+        }
     }
 
     public UUID getId() {

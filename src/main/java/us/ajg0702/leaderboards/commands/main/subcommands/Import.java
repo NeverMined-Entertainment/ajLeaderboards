@@ -51,44 +51,43 @@ public class Import extends SubCommand {
             sender.sendMessage(plugin.getMessages().getComponent("commands.import.starting", "FILE:"+file.getName()));
             try {
                 Gson gson = new Gson();
-                Reader fileReader = new FileReader(file);
-                JsonObject object = gson.fromJson(fileReader, JsonObject.class);
-                Set<String> boards;
-                try {
-                    boards = object.keySet();
-                } catch(NoSuchMethodError e) {
-                    boards = new HashSet<>();
-                    for(Map.Entry<String, JsonElement> entry : object.entrySet()) {
-                        boards.add(entry.getKey());
+                try (Reader fileReader = new FileReader(file)) {
+                    JsonObject object = gson.fromJson(fileReader, JsonObject.class);
+                    Set<String> boards;
+                    try {
+                        boards = object.keySet();
+                    } catch(NoSuchMethodError e) {
+                        boards = new HashSet<>();
+                        for(Map.Entry<String, JsonElement> entry : object.entrySet()) {
+                            boards.add(entry.getKey());
+                        }
                     }
+
+                    boards.remove("meta"); // we don't need to import metadata from the export
+
+                    int i = 0;
+                    for(String board : boards) {
+                        if(!plugin.getCache().boardExists(board)) {
+                            plugin.getCache().createBoard(board);
+                        }
+
+                        Debug.info("Importing "+board);
+
+                        List<DbRow> rows = new ArrayList<>();
+                        JsonArray jsonRowList = object.getAsJsonArray(board);
+                        for(JsonElement element : jsonRowList) {
+                            Debug.info(gson.toJson(element));
+                            rows.add(DbRow.fromJsonObject(element.getAsJsonObject()));
+                        }
+
+                        plugin.getCache().insertRows(board, rows);
+                        sender.sendMessage(plugin.getMessages().getComponent("commands.import.insertprogress", "DONE:"+ ++i, "TOTAL:"+boards.size()));
+                        plugin.getLogger().info(String.format("Import progress: %d/%d fetched", i, boards.size()));
+                    }
+
+                    sender.sendMessage(plugin.getMessages().getComponent("commands.import.success", "FILE:"+file.getName()));
+                    plugin.getLogger().info("Import from "+args[0]+" finished");
                 }
-
-                boards.remove("meta"); // we don't need to import metadata from the export
-
-                int i = 0;
-                for(String board : boards) {
-                    if(!plugin.getCache().boardExists(board)) {
-                        plugin.getCache().createBoard(board);
-                    }
-
-                    Debug.info("Importing "+board);
-
-                    List<DbRow> rows = new ArrayList<>();
-                    JsonArray jsonRowList = object.getAsJsonArray(board);
-                    for(JsonElement element : jsonRowList) {
-                        Debug.info(gson.toJson(element));
-                        rows.add(DbRow.fromJsonObject(element.getAsJsonObject()));
-                    }
-
-                    plugin.getCache().insertRows(board, rows);
-                    sender.sendMessage(plugin.getMessages().getComponent("commands.import.insertprogress", "DONE:"+ ++i, "TOTAL:"+boards.size()));
-                    plugin.getLogger().info(String.format("Import progress: %d/%d fetched", i, boards.size()));
-                }
-
-                fileReader.close();
-
-                sender.sendMessage(plugin.getMessages().getComponent("commands.import.success", "FILE:"+file.getName()));
-                plugin.getLogger().info("Import from "+args[0]+" finished");
             } catch (Exception e) {
                 plugin.getLogger().log(Level.SEVERE, "Error while importing cache:", e);
                 sender.sendMessage(plugin.getMessages().getComponent("commands.import.fail"));

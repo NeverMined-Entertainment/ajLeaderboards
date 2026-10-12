@@ -26,15 +26,19 @@ public class H2Method implements CacheMethod {
     private LeaderboardPlugin plugin;
     private ConfigFile config;
     private Cache cacheInstance;
+    private boolean initialized = false;
     @Override
-    public Connection getConnection() {
+    public Connection getConnection() throws SQLException {
         try {
-            if(conn.isClosed()) {
+            if(conn == null || conn.isClosed()) {
                 plugin.getLogger().warning("H2 connection is dead, making a new one");
                 init(plugin, config, cacheInstance);
             }
         } catch (SQLException e) {
             e.printStackTrace();
+        }
+        if (!initialized) {
+            throw new SQLException("H2 database not initialized");
         }
         return new UnClosableConnection(conn);
     }
@@ -76,6 +80,7 @@ public class H2Method implements CacheMethod {
             e.printStackTrace();
             return;
         }
+        initialized = true;
         List<String> tables = cacheInstance.getDbTableList();
 
         try(Statement statement = conn.createStatement()) {
@@ -92,7 +97,8 @@ public class H2Method implements CacheMethod {
                 } catch(NumberFormatException e) {
                     version = 0;
                 } catch(SQLException e) {
-                    if(e.getMessage().contains("Column 'COMMENT' not found")) {
+                    String message = e.getMessage();
+                    if(message != null && message.contains("Column 'COMMENT' not found")) {
                         version = 0;
                     } else {
                         throw e;
@@ -107,7 +113,8 @@ public class H2Method implements CacheMethod {
                         statement.executeUpdate("alter table \""+tableName+"\" add column "+type.lowerName()+"_lasttotal BIGINT");
                         statement.executeUpdate("alter table \""+tableName+"\" add column "+type.lowerName()+"_timestamp BIGINT");
                     } catch(SQLException e) {
-                        if(e.getMessage().contains("42121")) {
+                        String message = e.getMessage();
+                        if(message != null && message.contains("42121")) {
 //                            plugin.getLogger().info("The columns already exist for "+tableName+". Canceling updater and bumping DB version.");
                             try {
                                 //conn.createStatement().executeUpdate("UPDATE INFORMATION_SCHEMA.COLUMNS where TABLE_NAME=\""+tableName+"\" SET REMARKS = '1';");
@@ -122,6 +129,16 @@ public class H2Method implements CacheMethod {
                     }
                     statement.executeUpdate("COMMENT ON TABLE \""+tableName+"\" IS '2';");
                     version = 2;
+                }
+                if(version == 2) {
+                    for (TimedType type : TimedType.values()) {
+                        String index = type == TimedType.ALLTIME ? "value" : type.lowerName()+"_delta";
+                        conn.createStatement().executeUpdate(
+                                "create index if not exists `" + index + "` on `"+tableName+"` (`" + index + "`)"
+                        );
+                    }
+                    statement.executeUpdate("COMMENT ON TABLE \""+tableName+"\" IS '3';");
+                    version = 3;
                 }
             }
         } catch (SQLException e) {

@@ -12,13 +12,15 @@ repositories {
     maven { url = uri("https://repo.codemc.org/repository/maven-releases/") }
     maven { url = uri("https://repo.ajg0702.us/releases/") }
     maven { url = uri("https://repo.minebench.de/") }
+    maven { url = uri("https://hub.spigotmc.org/nexus/content/repositories/snapshots/") }
+    maven { url = uri("https://oss.sonatype.org/content/repositories/snapshots") }
 }
 
 dependencies {
     compileOnly(group = "org.spigotmc", name = "spigot", version = "1.19-R0.1-SNAPSHOT")
     testImplementation("org.junit.jupiter:junit-jupiter-api:5.6.0")
     testRuntimeOnly("org.junit.jupiter:junit-jupiter-engine")
-    compileOnly("us.ajg0702:ajUtils:1.2.29")
+    compileOnly("us.ajg0702:ajUtils:1.2.38")
     compileOnly("net.skinsrestorer:skinsrestorer-api:14.1.10")
     compileOnly("com.squareup.okhttp3:okhttp:4.11.0")
 }

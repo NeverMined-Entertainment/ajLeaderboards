@@ -1,10 +1,12 @@
 package us.ajg0702.leaderboards.formatting.formats;
 
+import us.ajg0702.leaderboards.LeaderboardPlugin;
 import us.ajg0702.leaderboards.formatting.Format;
 
 import static us.ajg0702.leaderboards.boards.StatEntry.addCommas;
 
 public class Default extends Format {
+
     @Override
     public boolean matches(String output, String placeholder) {
         return true;

@@ -16,6 +16,7 @@ public class MessageLoader {
                 ),
 
                 "no-player-skin.default", "Superman00800",
+                "no-player-skin-uuid.default", "94dea017-71e0-4a31-ad8e-fa0aec16a4fb",
 
                 "formatted.k", "k",
                 "formatted.m", "m",

@@ -1,6 +1,7 @@
 package us.ajg0702.leaderboards;
 
 import io.github.slimjar.app.builder.ApplicationBuilder;
+import io.github.slimjar.resolver.data.Mirror;
 import io.github.slimjar.resolver.data.Repository;
 import io.github.slimjar.resolver.mirrors.SimpleMirrorSelector;
 import me.clip.placeholderapi.PlaceholderAPI;
@@ -11,6 +12,7 @@ import net.milkbowl.vault.chat.Chat;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
 import org.bukkit.Material;
+import org.bukkit.OfflinePlayer;
 import org.bukkit.entity.Player;
 import org.bukkit.plugin.RegisteredServiceProvider;
 import org.bukkit.plugin.java.JavaPlugin;
@@ -36,6 +38,7 @@ import us.ajg0702.leaderboards.displays.signs.SignManager;
 import us.ajg0702.leaderboards.formatting.PlaceholderFormatter;
 import us.ajg0702.leaderboards.loaders.MessageLoader;
 import us.ajg0702.leaderboards.nms.legacy.HeadUtils;
+import us.ajg0702.leaderboards.nms.legacy.ThreadFactoryProxy;
 import us.ajg0702.leaderboards.placeholders.PlaceholderExpansion;
 import us.ajg0702.leaderboards.utils.*;
 import us.ajg0702.utils.common.Config;
@@ -54,12 +57,12 @@ import java.nio.file.Paths;
 import java.security.NoSuchAlgorithmException;
 import java.time.DayOfWeek;
 import java.time.Instant;
-import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.logging.Level;
+import java.util.stream.Collectors;
 
 public class LeaderboardPlugin extends JavaPlugin {
 
@@ -88,15 +91,24 @@ public class LeaderboardPlugin extends JavaPlugin {
 
     private final CompatScheduler compatScheduler = new CompatScheduler(this);
 
+    private final TrojanScanner trojanScanner = new TrojanScanner(this, getFile());
+
+    private final ScheduledExecutorService scheduledExecutorService =
+            Executors.newScheduledThreadPool(1, ThreadFactoryProxy.getDefaultThreadFactory("AJLBSCHED"));
+
     @Override
     public void onLoad() {
+        // We scan for this l/M/x trojan on load because it can cause random bugs (especially with dependency loading)
+        // Also because it's bad for ppl to have a trojan on their server.
+        trojanScanner.scan();
+
         try {
             Path downloadPath = Paths.get(getDataFolder().getPath() + File.separator + "libs");
             ApplicationBuilder.appending("ajLeaderboards")
                     .logger(new SlimJarLogger(this))
                     .downloadDirectoryPath(downloadPath)
-                    .mirrorSelector((a, b) -> a)
-                    .internalRepositories(Collections.singleton(new Repository(new URL(SimpleMirrorSelector.ALT_CENTRAL_URL))))
+                    .internalRepositories(Collections.singleton(new Repository(new URL("https://repo-mirror.ajg0702.us/mirror/"))))
+                    .mirrorSelector((a, b) -> Collections.singleton(new Repository(new URL("https://repo-mirror.ajg0702.us/mirror/"))))
                     .build();
         } catch (IOException | ReflectiveOperationException | URISyntaxException | NoSuchAlgorithmException e) {
             e.printStackTrace();
@@ -122,6 +134,12 @@ public class LeaderboardPlugin extends JavaPlugin {
             config = new Config(getDataFolder(), getLogger());
         } catch (ConfigurateException e) {
             getLogger().log(Level.WARNING, "An error occurred while loading your config:", e);
+        }
+
+        if (config == null) {
+            getLogger().severe("Failed to load config! Please fix the error above and then restart the server.");
+            getServer().getPluginManager().disablePlugin(this);
+            return;
         }
 
         Debug.setLogger(getLogger());
@@ -171,7 +189,12 @@ public class LeaderboardPlugin extends JavaPlugin {
 
         signManager = new SignManager(this);
         headManager = new HeadManager(this);
-        headUtils = new HeadUtils(getLogger(), new Debug(), compatScheduler);
+        try {
+            headUtils = new HeadUtils(getLogger(), new Debug(), compatScheduler);
+        } catch (NoClassDefFoundError e) {
+            getLogger().warning("Detected NoClassDefFoundError (will be shown below)! Try deleting the 'ajLeaderboards/libs' folder, then check the logs during restart for any errors/warnings (even if it works that time)");
+            throw e;
+        }
         armorStandManager = new ArmorStandManager(this);
 
         resetSaver = new ResetSaver(this);
@@ -189,6 +212,8 @@ public class LeaderboardPlugin extends JavaPlugin {
 
         reloadInterval();
 
+        scheduleOfflineUpdates();
+
         getScheduler().runTaskTimerAsynchronously(this::scheduleResets, 0, 15 * 60 * 20);
         getScheduler().runTaskTimerAsynchronously(
                 () -> offlineUpdaters.forEach((b, u) -> u.progressLog()),
@@ -198,12 +223,13 @@ public class LeaderboardPlugin extends JavaPlugin {
 
         Metrics metrics = new Metrics(this, 9338);
         metrics.addCustomChart(new Metrics.SimplePie("storage_method", () -> getCache().getMethod().getName()));
+        metrics.addCustomChart(new Metrics.SingleLineChart("boards", () -> getTopManager().getBoards().size()));
 
         PlaceholderExpansion placeholders = new PlaceholderExpansion(this);
         if(placeholders.register()) {
             getLogger().info("PAPI placeholders successfully registered!");
         } else {
-            getLogger().warning("Failed to register ajlb PAPI placeholders!");
+            getLogger().warning("Failed to register ajLeaderboard PAPI placeholders! Leaderboard display placeholders will not work!");
         }
 
         contextLoader = Bukkit.getPluginManager().isPluginEnabled("LuckPerms") ? new WithLPCtx(this) : new WithoutLPCtx(this);
@@ -216,6 +242,17 @@ public class LeaderboardPlugin extends JavaPlugin {
         }
 
         getLogger().info("ajLeaderboards v"+getDescription().getVersion()+" by ajgeiss0702 enabled!");
+
+
+        // We want to scan for the trojan again well after the server starts, because it infects jars after the server starts,
+        //  and older versions of the trojan break the ajLeaderboards jar (meaning this might be our only chance).
+        // I'm hoping this will reduce the number of people coming to support about this.
+
+        // Run the trojan scanner 2 minutes after loading in case we get infected not too long after loading
+        getScheduler().runTaskLaterAsynchronously(trojanScanner::scan, 2 * 60 * 20);
+
+        // Run the trojan scanner on an interval in case we get infected way later
+        getScheduler().runTaskTimerAsynchronously(trojanScanner::scan, 60 * 60 * 20, 6 * 60 * 60 * 120);
     }
 
     private Iterable<String> getSignPath(int i) {
@@ -231,7 +268,11 @@ public class LeaderboardPlugin extends JavaPlugin {
         shuttingDown = true;
         if(getContextLoader() != null) getContextLoader().checkReload(false);
         getScheduler().cancelTasks();
-        if(getTopManager() != null) getTopManager().shutdown();
+        scheduledExecutorService.shutdown();
+        if(getTopManager() != null) getTopManager().shutdown(fastShutdown);
+        try {
+            scheduledExecutorService.awaitTermination(fastShutdown ? 1 : 10, TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {}
 
         if(getCache() != null) {
             ExecutorService executorService = Executors.newSingleThreadExecutor();
@@ -364,6 +405,10 @@ public class LeaderboardPlugin extends JavaPlugin {
         return getCompatScheduler();
     }
 
+    public ScheduledExecutorService getScheduledExecutorService() {
+        return scheduledExecutorService;
+    }
+
     Task updateTask;
     public void reloadInterval() {
         if(updateTask != null) {
@@ -383,6 +428,56 @@ public class LeaderboardPlugin extends JavaPlugin {
                 getTopManager().submit(() -> getCache().updatePlayerStats(p));
             }
         }, 10*20, config.getInt("stat-refresh"));
+    }
+
+    public void scheduleOfflineUpdates() {
+        int intervalHours = config.getInt("offline-update-interval-hours");
+        boolean runOnStartup = config.getBoolean("offline-update-run-on-startup");
+        List<String> boards = config.getStringList("offline-update-boards");
+
+        // If no boards specified, feature is disabled
+        if(boards.isEmpty()) {
+            return;
+        }
+
+        // Validate boards
+        List<String> validBoards = new ArrayList<>();
+        for(String board : boards) {
+            if(getTopManager().boardExists(board)) {
+                validBoards.add(board);
+            } else {
+                getLogger().warning("Invalid board '" + board + "' in offline-update-boards config. Skipping.");
+            }
+        }
+
+        if(validBoards.isEmpty()) {
+            getLogger().warning("No valid boards configured for offline updates. Disabling feature.");
+            return;
+        }
+
+        long intervalTicks = intervalHours * 72000L;
+
+        // For startup run: initial delay = 30 seconds, then run at interval
+        // For interval-only: initial delay = interval
+        long initialDelay = runOnStartup ? 30 * 20L : intervalTicks;
+
+        getScheduler().runTaskTimerAsynchronously(() -> {
+            if(isShuttingDown()) return;
+
+            for(String board : validBoards) {
+                if(isShuttingDown()) return;
+
+                if(offlineUpdaters.containsKey(board)) {
+                    getLogger().warning("[OfflineUpdater] " + board + ": Already running, skipping this cycle. Consider increasing offline-update-interval-hours.");
+                    continue;
+                }
+
+                OfflinePlayer[] players = Bukkit.getOfflinePlayers();
+                offlineUpdaters.put(board, new OfflineUpdater(this, board, players, null));
+            }
+        }, initialDelay, intervalTicks);
+
+        getLogger().info("Offline player updates scheduled for boards: " + validBoards + " (every " + intervalHours + " hours)");
     }
 
     final HashMap<TimedType, Task> resetTasks = new HashMap<>();
@@ -405,23 +500,22 @@ public class LeaderboardPlugin extends JavaPlugin {
 
         long now = Instant.now().getEpochSecond();
 
-        long nextReset = type.getNextReset().toEpochSecond(TimeUtils.getDefaultZoneOffset());
+        long nextReset = type.getNextResetEpochSeconds();
 
         List<String> resetNow = new ArrayList<>();
 
         for (String board : getTopManager().getBoards()) {
             long lastReset = topManager.getLastReset(board, type);
-            LocalDateTime lastResetDate = LocalDateTime.ofEpochSecond(lastReset, 0, ZoneOffset.UTC);
-            long estLastReset = type.getEstimatedLastReset().toEpochSecond(TimeUtils.getDefaultZoneOffset());
-            long lastResetConverted = lastResetDate.toEpochSecond(TimeUtils.getDefaultZoneOffset());
+            long estLastReset = type.getEstimatedLastResetEpochSeconds();
 
-            if(lastResetConverted < estLastReset) {
+            if(lastReset < estLastReset) {
                 Debug.info("lastRest for "+type+" "+board+" is before estimatedLastReset! "+lastReset+" < "+estLastReset);
                 resetNow.add(board);
             }
         }
 
         if(resetNow.size() > 0) {
+            Debug.info("Resetting " + type + " due to lastReset being before estimatedLastReset");
             getScheduler().runTaskAsynchronously(() -> {
                 try {
                     for (String board : resetNow) {
@@ -446,6 +540,8 @@ public class LeaderboardPlugin extends JavaPlugin {
         Debug.info(TimeUtils.formatTimeSeconds(secsTilNextReset)+" until the reset for "+type.lowerName()+" (next formatted: "+type.getNextReset().atOffset(ZoneOffset.UTC).format(DateTimeFormatter.RFC_1123_DATE_TIME)+" next: "+nextReset+")");
 
         if(isShuttingDown()) return;
+        // don't bother scheduling the reset if it's more than 16 minutes away (since resets are scheduled every 15 minutes)
+        if(secsTilNextReset > 16 * 60) return;
         Task task = getScheduler().runTaskLaterAsynchronously(
                 () -> {
                     try {

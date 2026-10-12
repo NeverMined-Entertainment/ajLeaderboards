@@ -22,12 +22,14 @@ import us.ajg0702.leaderboards.utils.BoardPlayer;
 import us.ajg0702.leaderboards.utils.Partition;
 import us.ajg0702.utils.common.ConfigFile;
 
+import java.time.Instant;
 import java.sql.*;
-import java.time.LocalDateTime;
 import java.time.ZoneOffset;
 import java.time.format.DateTimeFormatter;
 import java.util.*;
-import java.util.concurrent.*;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
+import java.util.concurrent.ExecutionException;
 import java.util.logging.Level;
 
 @SuppressWarnings("FieldCanBeLocal")
@@ -36,11 +38,15 @@ public class Cache {
 
 	private final String SELECT_POSITION = "select 'id','value','namecache','prefixcache','suffixcache','displaynamecache',"+deltaBuilder()+" from '%s' order by '%s' %s, namecache desc limit 1 offset %d";
 	private final String SELECT_PLAYER = "select 'id','value','namecache','prefixcache','suffixcache','displaynamecache',"+deltaBuilder()+" from '%s' order by '%s' %s, namecache desc";
-	private final String GET_POSITION = "/*%s*/with N as (select *,ROW_NUMBER() OVER (order by '%s' %s, namecache desc) as position from '%s') select 'id','value','namecache','prefixcache','suffixcache','displaynamecache',position,"+deltaBuilder()+" from N where 'id'=?";
+	private final String GET_POSITION = "/*%s*/select *,(" +
+				"select count(*) + 1 from '%s' as t2 where " +
+					"t2.'%s' %s t1.'%s' OR " +
+					"(t2.'%s' = t1.'%s' AND t2.namecache > t1.namecache)" + // simple tiebreaker to make sure it's at least consistent
+			") as position from '%s' as t1 where id = ?";
 	private final Map<String, String> CREATE_TABLE = ImmutableMap.of(
-			"sqlite", "create table if not exists '%s' (id TEXT PRIMARY KEY, value DECIMAL(65, 2)"+columnBuilder("DECIMAL(65, 2)")+", namecache TEXT, prefixcache TEXT, suffixcache TEXT, displaynamecache TEXT)",
-			"h2", "create table if not exists '%s' ('id' VARCHAR(36) PRIMARY KEY, 'value' DECIMAL(65, 2)"+columnBuilder("DECIMAL(65, 2)")+", 'namecache' VARCHAR(16), 'prefixcache' VARCHAR(1024), 'suffixcache' VARCHAR(1024), 'displaynamecache' VARCHAR(2048))",
-			"mysql", "create table if not exists '%s' ('id' VARCHAR(36) PRIMARY KEY, 'value' DECIMAL(65, 2)"+columnBuilder("DECIMAL(65, 2)")+", 'namecache' VARCHAR(16), 'prefixcache' VARCHAR(1024), 'suffixcache' VARCHAR(1024), 'displaynamecache' VARCHAR(2048))"
+			"sqlite", "create table if not exists '%s' (id TEXT PRIMARY KEY, value DECIMAL(65, 5)"+columnBuilder("DECIMAL(65, 5)")+", namecache TEXT, prefixcache TEXT, suffixcache TEXT, displaynamecache TEXT)",
+			"h2", "create table if not exists '%s' ('id' VARCHAR(36) PRIMARY KEY, 'value' DECIMAL(65, 5)"+columnBuilder("DECIMAL(65, 5)")+", 'namecache' VARCHAR(16), 'prefixcache' VARCHAR(1024), 'suffixcache' VARCHAR(1024), 'displaynamecache' VARCHAR(2048))",
+			"mysql", "create table if not exists '%s' ('id' VARCHAR(36) PRIMARY KEY, 'value' DECIMAL(65, 5)"+columnBuilder("DECIMAL(65, 5)")+", 'namecache' VARCHAR(16), 'prefixcache' VARCHAR(1024), 'suffixcache' VARCHAR(1024), 'displaynamecache' VARCHAR(2048))"
 	);
 	private final String REMOVE_PLAYER = "delete from '%s' where 'namecache'=?";
 	private final Map<String, String> LIST_TABLES = ImmutableMap.of(
@@ -56,7 +62,8 @@ public class Cache {
 	private final String QUERY_IDVALUE = "select id,'value' from '%s'";
 	private final String UPDATE_RESET = "update '%s' set '%s'=?, '%s'=?, '%s'=? where id=?";
 	private final String QUERY_ALL = "select * from '%s'";
-	private final String CREATE_TIMESTAMP_INDEX = "create index %s_timestamp on '%s' (%s_timestamp)";
+	private final String CREATE_TIMESTAMP_INDEX = "create index '%s_timestamp' on '%s' (%s_timestamp)";
+	private final String CREATE_VALUE_INDEX = "create index '%s' on '%s' ('%s')";
 
 
 
@@ -70,7 +77,7 @@ public class Cache {
 
 	final String tablePrefix;
 
-	List<String> nonExistantBoards = new ArrayList<>();
+	List<String> nonExistantBoards = new CopyOnWriteArrayList<>();
 
 	public Cache(LeaderboardPlugin plugin) {
 		this.plugin = plugin;
@@ -119,24 +126,23 @@ public class Cache {
 			}
 			return StatEntry.boardNotFound(position, board, type);
 		}
+		if(position <= 0) {
+			return StatEntry.error(position, board, type);
+		}
 		boolean reverse = plugin.getAConfig().getStringList("reverse-sort").contains(board);
-		try {
-			Connection conn = method.getConnection();
+		try (Connection conn = method.getConnection()) {
 			String sortBy = type == TimedType.ALLTIME ? "value" : type.lowerName() + "_delta";
-			PreparedStatement ps = conn.prepareStatement(String.format(
+			try (PreparedStatement ps = conn.prepareStatement(String.format(
 					method.formatStatement(SELECT_POSITION),
 					tablePrefix+board,
 					sortBy,
 					reverse ? "asc" : "desc",
 					position-1
-			));
-
-			ResultSet r = ps.executeQuery();
-
-			StatEntry se = processData(r, sortBy, position, board, type);
-			ps.close();
-			method.close(conn);
-			return se;
+			))) {
+				try (ResultSet r = ps.executeQuery()) {
+					return processData(r, sortBy, position, board, type);
+				}
+			}
 		} catch(SQLException e) {
 			plugin.getLogger().log(Level.WARNING, "Unable to get stat of player:", e);
 			return StatEntry.error(position, board, type);
@@ -156,66 +162,59 @@ public class Cache {
 		}
 		boolean reverse = plugin.getAConfig().getStringList("reverse-sort").contains(board);
 		StatEntry r = null;
-		try {
-			Connection conn = method.getConnection();
+		try (Connection conn = method.getConnection()) {
 			String sortBy = type == TimedType.ALLTIME ? "value" : type.lowerName() + "_delta";
-			PreparedStatement ps = conn.prepareStatement(String.format(
+			try (PreparedStatement ps = conn.prepareStatement(String.format(
 					method.formatStatement(GET_POSITION),
 					board,
+					tablePrefix+board,
 					sortBy,
-					reverse ? "asc" : "desc",
+					reverse ? "<" : ">",
+					sortBy,
+					sortBy,
+					sortBy,
 					tablePrefix+board
-			));
+			))) {
+				ps.setString(1, player.getUniqueId().toString());
 
-			ps.setString(1, player.getUniqueId().toString());
+				try (ResultSet rs = ps.executeQuery()) {
+					if (!rs.next()) {
+						return StatEntry.noData(plugin, -1, board, type);
+					}
 
-			ResultSet rs = ps.executeQuery();
-
-			rs.next();
-
-			String uuidraw = null;
-			double value = -1;
-			String name = "-Unknown-";
-			String displayName = name;
-			String prefix = "";
-			String suffix = "";
-			int position = -1;
-			try {
-				uuidraw = rs.getString(1);
-				name = rs.getString(3);
-				prefix = rs.getString(4);
-				suffix = rs.getString(5);
-				displayName = rs.getString(6);
-				position = rs.getInt(7);
-				value = rs.getDouble(sortByIndexes.computeIfAbsent(sortBy,
-						k -> {
-							try {
-								Debug.info("Calculating (statentry) column for "+sortBy);
-								return rs.findColumn(sortBy);
-							} catch (SQLException e) {
-								plugin.getLogger().log(Level.SEVERE, "Error while finding a column for "+sortBy, e);
-								return -1;
-							}
+					String uuidraw = null;
+					double value = -1;
+					String name = "-Unknown-";
+					String displayName = name;
+					String prefix = "";
+					String suffix = "";
+					int position = -1;
+					try {
+						uuidraw = rs.getString("id");
+						name = rs.getString("namecache");
+						prefix = rs.getString("prefixcache");
+						suffix = rs.getString("suffixcache");
+						displayName = rs.getString("displaynamecache");
+						position = rs.getInt("position");
+						value = rs.getDouble(sortBy);
+					} catch(SQLException e) {
+						String message = e.getMessage();
+						if(message == null || 
+								(!message.contains("ResultSet closed") &&
+										!message.contains("empty result set") &&
+										!message.contains("[2000-")
+								)) {
+							throw e;
 						}
-				));
-			} catch(SQLException e) {
-				if(
-						!e.getMessage().contains("ResultSet closed") &&
-								!e.getMessage().contains("empty result set") &&
-								!e.getMessage().contains("[2000-")
-				) {
-					throw e;
+					}
+					if(prefix == null) prefix = "";
+					if(suffix == null) suffix = "";
+					if(displayName == null) displayName = name;
+					if(uuidraw != null) {
+						r = new StatEntry(position, board, prefix, name, displayName, UUID.fromString(uuidraw), suffix, value, type);
+					}
 				}
 			}
-			if(prefix == null) prefix = "";
-			if(suffix == null) suffix = "";
-			if(displayName == null) displayName = name;
-			if(uuidraw != null) {
-				r = new StatEntry(position, board, prefix, name, displayName, UUID.fromString(uuidraw), suffix, value, type);
-			}
-			rs.close();
-			ps.close();
-			method.close(conn);
 		} catch (SQLException e) {
 			plugin.getLogger().log(Level.WARNING, "Unable to get position/value of player:", e);
 			return StatEntry.error(-1, board, type);
@@ -238,47 +237,31 @@ public class Cache {
 			return -3;
 		}
 
-		Connection connection = null;
-		ResultSet rs = null;
-
-		int size;
-
-		try {
-			connection = method.getConnection();
-
-			PreparedStatement ps = connection.prepareStatement(String.format(
+		try (Connection connection = method.getConnection()) {
+			try (PreparedStatement ps = connection.prepareStatement(String.format(
 					method.formatStatement("select COUNT(1) from '%s'"),
 					tablePrefix+board
-			));
-
-			rs = ps.executeQuery();
-
-			rs.next();
-
-			size = rs.getInt(1);
-
+			))) {
+				try (ResultSet rs = ps.executeQuery()) {
+					if (!rs.next()) {
+						return 0;
+					}
+					return rs.getInt(1);
+				}
+			}
 		} catch (SQLException e) {
-			if(
-					!e.getMessage().contains("ResultSet closed") &&
-							!e.getMessage().contains("empty result set") &&
-							!e.getMessage().contains("[2000-")
-			) {
+			String message = e.getMessage();
+			if(message == null ||
+					(!message.contains("ResultSet closed") &&
+							!message.contains("empty result set") &&
+							!message.contains("[2000-")
+			)) {
 				plugin.getLogger().log(Level.WARNING, "Unable to get size of board:", e);
 				return -1;
 			} else {
 				return 0;
 			}
-		} finally {
-			try {
-				if(connection != null) method.close(connection);
-				if(rs != null) rs.close();
-			} catch (SQLException e) {
-				plugin.getLogger().log(Level.WARNING, "Error while closing resources from board size fetch:", e);
-			}
-
 		}
-
-		return size;
 	}
 
 	public double getTotal(String board, TimedType type) {
@@ -289,80 +272,73 @@ public class Cache {
 			return -3;
 		}
 
-		Connection connection = null;
-		ResultSet rs = null;
-
-		double total;
-
-		try {
-			connection = method.getConnection();
-
-			PreparedStatement ps = connection.prepareStatement(String.format(
+		try (Connection connection = method.getConnection()) {
+			try (PreparedStatement ps = connection.prepareStatement(String.format(
 					method.formatStatement("select SUM(%s) as total from '%s'"),
 					type == TimedType.ALLTIME ? "\"value\"" : type.lowerName() + "_delta",
 					tablePrefix+board
-			));
-
-			rs = ps.executeQuery();
-
-			rs.next();
-
-			total = rs.getDouble(1);
-
+			))) {
+				try (ResultSet rs = ps.executeQuery()) {
+					if (!rs.next()) {
+						return 0;
+					}
+					return rs.getDouble(1);
+				}
+			}
 		} catch (SQLException e) {
-			if(
-					!e.getMessage().contains("ResultSet closed") &&
-							!e.getMessage().contains("empty result set") &&
-							!e.getMessage().contains("[2000-")
-			) {
+			String message = e.getMessage();
+			if(message == null ||
+					(!message.contains("ResultSet closed") &&
+							!message.contains("empty result set") &&
+							!message.contains("[2000-")
+			)) {
 				plugin.getLogger().log(Level.WARNING, "Unable to get total of board:", e);
 				return -1;
 			} else {
 				return 0;
 			}
-		} finally {
-			try {
-				if(connection != null) method.close(connection);
-				if(rs != null) rs.close();
-			} catch (SQLException e) {
-				plugin.getLogger().log(Level.WARNING, "Error while closing resources from board size fetch:", e);
-			}
-
 		}
-
-		return total;
 	}
 
 	public boolean createBoard(String name) {
-		try {
-			Connection conn = method.getConnection();
-			PreparedStatement ps = conn.prepareStatement(method.formatStatement(String.format(
+		try (Connection conn = method.getConnection()) {
+			try (PreparedStatement ps = conn.prepareStatement(method.formatStatement(String.format(
 					CREATE_TABLE.get(method.getName()),
 					tablePrefix+name
-			)));
-
-			ps.executeUpdate();
-
-			ps.close();
-
-			for (TimedType type : TimedType.values()) {
-				if(type == TimedType.ALLTIME) continue;
-
-				try {
-					ps = conn.prepareStatement(method.formatStatement(String.format(
-							CREATE_TIMESTAMP_INDEX,
-							type.lowerName(),
-							tablePrefix+name,
-							type.lowerName()
-					)));
-					ps.executeUpdate();
-				} catch(SQLException e) {
-					if(!e.getMessage().contains("already exists") && !e.getMessage().contains("Duplicate key") ) throw e;
-				}
-				ps.close();
+			)))) {
+				ps.executeUpdate();
 			}
 
-			method.close(conn);
+			for (TimedType type : TimedType.values()) {
+
+				String index = type == TimedType.ALLTIME ? "value" : type.lowerName()+"_delta";
+				try (PreparedStatement ps = conn.prepareStatement(method.formatStatement(String.format(
+						CREATE_VALUE_INDEX,
+						index,
+						tablePrefix+name,
+						index
+						)))) {
+					ps.executeUpdate();
+				} catch(SQLException e) {
+					String message = e.getMessage();
+					if((message == null || !message.contains("already exists")) && !message.contains("Duplicate key") && e.getErrorCode() != 1061) throw e;
+				}
+
+				if(type == TimedType.ALLTIME) continue;
+
+				try (PreparedStatement ps = conn.prepareStatement(method.formatStatement(String.format(
+						CREATE_TIMESTAMP_INDEX,
+						type.lowerName(),
+						tablePrefix+name,
+						type.lowerName()
+				)))) {
+					ps.executeUpdate();
+				} catch(SQLException e) {
+					String message = e.getMessage();
+					if((message == null || !message.contains("already exists")) && !message.contains("Duplicate key") ) throw e;
+				}
+			}
+
 			plugin.getTopManager().fetchBoards();
 			plugin.getContextLoader().calculatePotentialContexts();
 			nonExistantBoards.remove(name);
@@ -381,20 +357,13 @@ public class Cache {
 	}
 
 	public boolean removePlayer(String board, String playerName) {
-
-		try {
-			Connection conn = method.getConnection();
-			PreparedStatement ps = conn.prepareStatement(String.format(
-					method.formatStatement(REMOVE_PLAYER),
-					tablePrefix+board
-			));
-
+		try (Connection conn = method.getConnection();
+			 PreparedStatement ps = conn.prepareStatement(String.format(
+					 method.formatStatement(REMOVE_PLAYER),
+					 tablePrefix+board
+			 ))) {
 			ps.setString(1, playerName);
-
 			ps.executeUpdate();
-
-			ps.close();
-			method.close(conn);
 			return true;
 		} catch (SQLException e) {
 			plugin.getLogger().log(Level.WARNING, "Unable to remove player from board:", e);
@@ -422,16 +391,15 @@ public class Cache {
 
 	public List<String> getDbTableList() {
 		List<String> b = new ArrayList<>();
-		try {
-
-			ResultSet r;
+		try (
 			Connection conn = method.getConnection();
 			Statement statement = conn.createStatement();
-			r = statement.executeQuery(
-					method.formatStatement(
-							LIST_TABLES.getOrDefault(method.getName(), "show tables;")
-					)
-			);
+			ResultSet r = statement.executeQuery(
+				method.formatStatement(
+					LIST_TABLES.getOrDefault(method.getName(), "show tables;")
+				)
+			)
+		) {
 			while(r.next()) {
 				String e = r.getString(1);
 				if(e.indexOf(tablePrefix) != 0) continue;
@@ -439,10 +407,6 @@ public class Cache {
 				if(name.equals("extras")) continue;
 				b.add(e);
 			}
-
-			statement.close();
-			r.close();
-			method.close(conn);
 		} catch(SQLException e) {
 			plugin.getLogger().log(Level.WARNING, "Unable to get list of tables:", e);
 		}
@@ -458,15 +422,13 @@ public class Cache {
 			if(method instanceof SqliteMethod) {
 				((SqliteMethod) method).newConnection();
 			}
-			Connection conn = method.getConnection();
-			PreparedStatement ps = conn.prepareStatement(String.format(
+			try (Connection conn = method.getConnection();
+				 PreparedStatement ps = conn.prepareStatement(String.format(
 					method.formatStatement(DROP_TABLE),
 					tablePrefix+board
-			));
-			ps.executeUpdate();
-
-			ps.close();
-			method.close(conn);
+			))) {
+				ps.executeUpdate();
+			}
 			plugin.getTopManager().fetchBoards();
 			plugin.getContextLoader().calculatePotentialContexts();
 			if(plugin.getTopManager().boardExists(board)) {
@@ -485,10 +447,12 @@ public class Cache {
 		for(String b : plugin.getTopManager().getBoards()) {
 			if(!updatableBoards.isEmpty() && !updatableBoards.contains(b)) continue;
 			if(plugin.isShuttingDown()) return;
-			if(player.isOnline() && player.getPlayer() != null) {
+			if(player.isOnline()) {
+				Player onlinePlayer = player.getPlayer();
 				if(
-						plugin.getAConfig().getBoolean("enable-dontupdate-permission") &&
-								player.getPlayer().hasPermission("ajleaderboards.dontupdate."+b)
+						onlinePlayer != null &&
+								plugin.getAConfig().getBoolean("enable-dontupdate-permission") &&
+								onlinePlayer.hasPermission("ajleaderboards.dontupdate."+b)
 				) continue;
 			}
 			// If this update isnt async, then dont run the event until it is async
@@ -549,6 +513,8 @@ public class Cache {
 			outputraw = PlaceholderAPI.setPlaceholders(player, "%"+alternatePlaceholders(board)+"%")
 					.replaceAll(",", "");
 			output = plugin.getPlaceholderFormatter().toDouble(outputraw, board);
+			if(Double.isNaN(output)) throw new NumberFormatException("Placeholder returned NaN");
+			if(Double.isInfinite(output)) throw new NumberFormatException("Placeholder returned Infinite");
 		} catch(NumberFormatException e) {
 			if(debug) Debug.info("Placeholder %"+board+"% for "+player.getName()+" returned a non-number! Ignoring it. Message: " + e);
 			return;
@@ -559,8 +525,11 @@ public class Cache {
 		if(debug) Debug.info("Placeholder "+board+" for "+player.getName()+" returned "+output);
 
 		String displayName = player.getName();
-		if(player.isOnline() && player.getPlayer() != null) {
-			displayName = player.getPlayer().getDisplayName();
+		if(player.isOnline()) {
+			Player onlinePlayer = player.getPlayer();
+			if(onlinePlayer != null) {
+				displayName = onlinePlayer.getDisplayName();
+			}
 		}
 
 		String prefix;
@@ -637,11 +606,11 @@ public class Cache {
 
 
 			if(debug) Debug.info("Updating "+player.getName()+" on board "+board+" with values v: "+output+" suffix: "+ finalSuffix +" prefix: "+ finalPrefix);
-			try(Connection conn = method.getConnection()) {
-				PreparedStatement statement = conn.prepareStatement(String.format(
+			try(Connection conn = method.getConnection();
+			    PreparedStatement statement = conn.prepareStatement(String.format(
 						method.formatStatement(method.getName().equals("h2") ? INSERT_OR_UPDATE_PLAYER_H2 : INSERT_OR_UPDATE_PLAYER),
 						tablePrefix+board
-				));
+				))) {
 				statement.setString(1, player.getUniqueId().toString());
 				statement.setDouble(2, output);
 				statement.setString(3, player.getName());
@@ -657,7 +626,7 @@ public class Cache {
 					if(type == TimedType.ALLTIME) continue;
 					long lastReset = plugin.getTopManager().getLastReset(board, type)*1000;
 					if(plugin.isShuttingDown()) {
-						method.close(conn);
+						return;
 					}
 					Double lastTotal = lastTotals.get(type);
 					double lastTotalNumber = lastTotal == null ? output : lastTotal;
@@ -695,7 +664,6 @@ public class Cache {
 					Integer position = plugin.getTopManager()
 							.positionPlayerCache.getOrDefault(player.getUniqueId(), new HashMap<>())
 							.get(new BoardType(board, type));
-					Debug.info("Position for " + type + ": " + position);
 					if(position != null) {
 						StatEntry stat = plugin.getTopManager().getCachedStat(new PositionBoardType(position, board, type), false);
 						if(stat != null && player.getUniqueId().equals(stat.getPlayerID())) {
@@ -704,8 +672,6 @@ public class Cache {
 					}
 				}
 				statement.executeUpdate();
-				statement.close();
-				method.close(conn);
 
 			} catch(SQLException e) {
 				if(plugin.isShuttingDown()) return;
@@ -722,62 +688,51 @@ public class Cache {
 
 	public Double getLastTotal(String board, OfflinePlayer player, TimedType type) {
 		Double last = null;
-		try {
-			Connection conn = method.getConnection();
-			try {
-				PreparedStatement ps = conn.prepareStatement(String.format(
-						method.formatStatement(QUERY_LASTTOTAL),
-						type.lowerName()+"_lasttotal",
-						tablePrefix+board
-				));
-
-				ps.setString(1, player.getUniqueId().toString());
-
-				ResultSet rs = ps.executeQuery();
-
+		try (Connection conn = method.getConnection();
+		     PreparedStatement ps = conn.prepareStatement(String.format(
+					method.formatStatement(QUERY_LASTTOTAL),
+					type.lowerName()+"_lasttotal",
+					tablePrefix+board
+			))) {
+			ps.setString(1, player.getUniqueId().toString());
+			try (ResultSet rs = ps.executeQuery()) {
 				if(method instanceof MysqlMethod || method instanceof H2Method) {
-					rs.next();
+					if (!rs.next()) {
+						return last;
+					}
 				}
 				last = rs.getDouble(1);
-				rs.close();
-				ps.close();
-				method.close(conn);
-			} catch(SQLException e) {
-				method.close(conn);
-				String m = e.getMessage();
-				if(m.contains("empty result set") || m.contains("ResultSet closed") || m.contains("[2000-")) return last;
-				plugin.getLogger().log(Level.WARNING, "Unable to get last total for "+player.getName()+" on "+type+" of "+board, e);
 			}
-		} catch(SQLException ignored) {}
+		} catch(SQLException e) {
+			String m = e.getMessage();
+			if(m == null || m.contains("empty result set") || m.contains("ResultSet closed") || m.contains("[2000-")) return last;
+			plugin.getLogger().log(Level.WARNING, "Unable to get last total for "+player.getName()+" on "+type+" of "+board, e);
+		}
 
 		return last;
 	}
 
 	public long getLastReset(String board, TimedType type) {
 		long last = 0;
-		try {
-			Connection conn = method.getConnection();
-			try {
-				PreparedStatement ps = conn.prepareStatement(String.format(
-						method.formatStatement(QUERY_LASTRESET),
-						type.lowerName()+"_timestamp",
-						tablePrefix+board
-				));
-
-				ResultSet rs = ps.executeQuery();
+		try (Connection conn = method.getConnection();
+		     PreparedStatement ps = conn.prepareStatement(String.format(
+					method.formatStatement(QUERY_LASTRESET),
+					type.lowerName()+"_timestamp",
+					tablePrefix+board
+			))) {
+			try (ResultSet rs = ps.executeQuery()) {
 				if(method instanceof MysqlMethod || method instanceof H2Method) {
-					rs.next();
+					if (!rs.next()) {
+						return last;
+					}
 				}
 				last = rs.getLong(1);
-				ps.close();
-				method.close(conn);
-			} catch(SQLException e) {
-				method.close(conn);
-				String m = e.getMessage();
-				if(m.contains("empty result set") || m.contains("ResultSet closed") || m.contains("[2000-")) return last;
-				plugin.getLogger().log(Level.WARNING, "Unable to get last reset for "+type+" of "+board, e);
 			}
-		} catch(SQLException ignored) {}
+		} catch(SQLException e) {
+			String m = e.getMessage();
+			if(m == null || m.contains("empty result set") || m.contains("ResultSet closed") || m.contains("[2000-")) return last;
+			plugin.getLogger().log(Level.WARNING, "Unable to get last reset for "+type+" of "+board, e);
+		}
 
 		return last;
 	}
@@ -797,9 +752,8 @@ public class Cache {
 		Bukkit.getPluginManager().callEvent(new PreTimedTypeResetEvent(board, type));
 
 		long startTime = System.currentTimeMillis();
-		LocalDateTime startDateTime = LocalDateTime.now();
-		long newTime = startDateTime.atOffset(ZoneOffset.UTC).toEpochSecond()*1000;
-		Debug.info(board+" "+type+" "+startDateTime.atOffset(ZoneOffset.UTC).format(DateTimeFormatter.RFC_1123_DATE_TIME)+" "+newTime);
+		long newTime = Instant.now().toEpochMilli();
+		Debug.info(board+" "+type+" "+Instant.ofEpochMilli(newTime).atOffset(ZoneOffset.UTC).format(DateTimeFormatter.RFC_1123_DATE_TIME)+" "+newTime);
 
 
 		List<String> saveableTypes = plugin.getAConfig().getStringList("reset-save-types");
@@ -815,50 +769,38 @@ public class Cache {
 		}
 		Debug.info("last: "+lastReset+" gap: "+(startTime - lastReset));
 		String t = type.lowerName();
-		try {
-			Connection conn = method.getConnection();
-			PreparedStatement ps = conn.prepareStatement(String.format(
+		try (Connection conn = method.getConnection();
+		     PreparedStatement ps = conn.prepareStatement(String.format(
 					method.formatStatement(QUERY_IDVALUE),
 					tablePrefix+board
 			));
-
-			ResultSet rs = ps.executeQuery();
+		     ResultSet rs = ps.executeQuery()) {
 			Map<String, Double> uuids = new HashMap<>();
 			while(rs.next()) {
 				uuids.put(rs.getString(1), rs.getDouble(2));
 			}
-			rs.close();
-			ps.close();
-			method.close(conn);
 			Partition<String> partition = Partition.ofSize(new ArrayList<>(uuids.keySet()), Math.max(uuids.size()/(int) Math.ceil(method.getMaxConnections()/2D), 1));
 			Debug.info("Partition length: "+partition.size()+" uuids size: "+ uuids.size()+" partition chunk size: "+partition.getChunkSize());
 			for(List<String> uuidPartition : partition) {
 				if(plugin.isShuttingDown()) {
-					method.close(conn);
 					return;
 				}
-				try {
-					Connection con = method.getConnection();
+				try (Connection con = method.getConnection()) {
 					for(String idRaw : uuidPartition) {
-						if(plugin.isShuttingDown()) {
-							method.close(con);
-							return;
-						}
-						PreparedStatement p = con.prepareStatement(String.format(
+						try (PreparedStatement p = con.prepareStatement(String.format(
 								method.formatStatement(UPDATE_RESET),
 								tablePrefix+board,
 								t+"_lasttotal",
 								t+"_delta",
 								t+"_timestamp"
-						));
-						p.setDouble(1, uuids.get(idRaw));
-						p.setDouble(2, 0);
-						p.setLong(3, newTime);
-						p.setString(4, idRaw);
-						p.executeUpdate();
-						p.close();
+						))) {
+							p.setDouble(1, uuids.get(idRaw));
+							p.setDouble(2, 0);
+							p.setLong(3, newTime);
+							p.setString(4, idRaw);
+							p.executeUpdate();
+						}
 					}
-					method.close(con);
 				} catch (SQLException e) {
 					plugin.getLogger().log(Level.WARNING, "An error occurred while resetting "+type+" of "+board+":", e);
 				}
@@ -870,61 +812,53 @@ public class Cache {
 	}
 
 	public void insertRows(String board, List<DbRow> rows) throws SQLException {
-		Connection conn = method.getConnection();
-		for(DbRow row : rows) {
-			PreparedStatement statement = conn.prepareStatement(String.format(
-					method.formatStatement(INSERT_PLAYER),
-					tablePrefix+board
-			));
-			statement.setString(1, row.getId().toString());
-			statement.setDouble(2, row.getValue());
-			statement.setString(3, row.getNamecache());
-			statement.setString(4, row.getPrefixcache());
-			statement.setString(5, row.getSuffixcache());
-			statement.setString(6, row.getDisplaynamecache());
-			int i = 6;
-			for(TimedType type : TimedType.values()) {
-				if(type == TimedType.ALLTIME) continue;
+		try (Connection conn = method.getConnection()) {
+			for(DbRow row : rows) {
 				if(plugin.isShuttingDown()) {
-					method.close(conn);
+					return;
 				}
-				statement.setDouble(++i, row.getDeltas().get(type));
-				statement.setDouble(++i, row.getLastTotals().get(type));
-				statement.setLong(++i, row.getTimestamps().get(type));
-			}
-
-			try {
-				statement.executeUpdate();
-			} catch(SQLException e) {
-				if(e.getMessage().contains("23505") || e.getMessage().contains("Duplicate entry") || e.getMessage().contains("PRIMARY KEY constraint failed")) {
-					statement.close();
-					continue;
+				try (PreparedStatement statement = conn.prepareStatement(String.format(
+						method.formatStatement(INSERT_PLAYER),
+						tablePrefix+board
+				))) {
+					statement.setString(1, row.getId().toString());
+					statement.setDouble(2, row.getValue());
+					statement.setString(3, row.getNamecache());
+					statement.setString(4, row.getPrefixcache());
+					statement.setString(5, row.getSuffixcache());
+					statement.setString(6, row.getDisplaynamecache());
+					int i = 6;
+					for(TimedType type : TimedType.values()) {
+						if(type == TimedType.ALLTIME) continue;
+						statement.setDouble(++i, row.getDeltas().get(type));
+						statement.setDouble(++i, row.getLastTotals().get(type));
+						statement.setLong(++i, row.getTimestamps().get(type));
+					}
+					statement.executeUpdate();
+				} catch(SQLException e) {
+					String message = e.getMessage();
+					if(message != null && (message.contains("23505") || message.contains("Duplicate entry") || message.contains("PRIMARY KEY constraint failed"))) {
+						continue;
+					}
+					throw e;
 				}
-				throw e;
 			}
-			statement.close();
 		}
-		method.close(conn);
 	}
 
 	public List<DbRow> getRows(String board) throws SQLException {
-		Connection conn = method.getConnection();
-		PreparedStatement ps = conn.prepareStatement(String.format(
-				method.formatStatement(QUERY_ALL),
-				tablePrefix+board
-		));
-		ResultSet resultSet = ps.executeQuery();
-
-		List<DbRow> out = new ArrayList<>();
-
-		while(resultSet.next()) {
-			out.add(new DbRow(resultSet));
+		try (Connection conn = method.getConnection();
+			 PreparedStatement ps = conn.prepareStatement(String.format(
+					 method.formatStatement(QUERY_ALL),
+					 tablePrefix+board
+			 ));
+			 ResultSet resultSet = ps.executeQuery()) {
+			List<DbRow> out = new ArrayList<>();
+			while(resultSet.next()) {
+				out.add(new DbRow(resultSet));
+			}
+			return out;
 		}
-
-		ps.close();
-		resultSet.close();
-		method.close(conn);
-		return out;
 	}
 
 	public CacheMethod getMethod() {
@@ -1027,11 +961,12 @@ public class Cache {
 					}
 			));
 		} catch(SQLException e) {
-			if(
-					!e.getMessage().contains("ResultSet closed") &&
-							!e.getMessage().contains("empty result set") &&
-							!e.getMessage().contains("[2000-")
-			) {
+			String message = e.getMessage();
+			if(message == null ||
+					(!message.contains("ResultSet closed") &&
+							!message.contains("empty result set") &&
+							!message.contains("[2000-")
+			)) {
 				throw e;
 			}
 		}
@@ -1056,6 +991,7 @@ public class Cache {
 	 */
 	public void cleanPlayer(Player player) {
 		zeroPlayers.removeIf(boardPlayer -> boardPlayer.getPlayer().equals(player));
+		plugin.getTopManager().positionPlayerCache.remove(player.getUniqueId());
 	}
 
 	public List<String> getNonExistantBoards() {

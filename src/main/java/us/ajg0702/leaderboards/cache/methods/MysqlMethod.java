@@ -21,7 +21,9 @@ import java.util.Locale;
 public class MysqlMethod implements CacheMethod {
     @Override
     public Connection getConnection() throws SQLException {
-        if(ds == null) return null;
+        if(ds == null) {
+            throw new SQLException("DataSource not initialized - HikariCP connection pool unavailable");
+        }
         return ds.getConnection();
     }
 
@@ -32,17 +34,21 @@ public class MysqlMethod implements CacheMethod {
     @Override
     public void init(LeaderboardPlugin plugin, ConfigFile config, Cache cacheInstance) {
         String ip = config.getString("ip");
+        if (ip == null) throw new IllegalArgumentException("Missing required config: mysql.ip");
         String username = config.getString("username");
+        if (username == null) throw new IllegalArgumentException("Missing required config: mysql.username");
         String password = config.getString("password");
+        if (password == null) throw new IllegalArgumentException("Missing required config: mysql.password");
         String database = config.getString("database");
+        if (database == null) throw new IllegalArgumentException("Missing required config: mysql.database");
         boolean useSSL = config.getBoolean("useSSL");
         boolean allowPublicKeyRetrieval = config.getBoolean("allowPublicKeyRetrieval");
         int minCount = config.getInt("minConnections");
         int maxCount = config.getInt("maxConnections");
         String charEncoding = config.getString("characterEncoding");
+        if (charEncoding == null) throw new IllegalArgumentException("Missing required config: mysql.characterEncoding");
 
         String url = "jdbc:mysql://"+ip+"/"+database+"?useSSL="+useSSL+"&useUnicode=true&character_set_server="+charEncoding+"&allowPublicKeyRetrieval="+allowPublicKeyRetrieval+"&useInformationSchema=true";
-        hikariConfig.setDriverClassName("com.mysql.jdbc.Driver");
         hikariConfig.setJdbcUrl(url);
         hikariConfig.setUsername(username);
         hikariConfig.setPassword(password);
@@ -57,21 +63,23 @@ public class MysqlMethod implements CacheMethod {
 
         List<String> tables = cacheInstance.getDbTableList();
 
-        try(Connection conn = getConnection()) {
-            //ResultSet rs = conn.getMetaData().getTables(null, null, "", null);
-            Statement statement = conn.createStatement();
+        try(Connection conn = getConnection();
+             Statement statement = conn.createStatement()) {
             for(String tableName : tables) {
                 int version;
                 if(!tableName.startsWith(cacheInstance.getTablePrefix())) continue;
-                try {
-                    ResultSet rs = conn.createStatement().executeQuery("show table status where Name='"+tableName+"'");
-                    rs.next();
-                    version = Integer.parseInt(rs.getString("COMMENT"));
-                    rs.close();
+                try (Statement stmt = conn.createStatement();
+                    ResultSet rs = stmt.executeQuery("show table status where Name='"+tableName+"'")) {
+                    if(rs.next()) {
+                        version = Integer.parseInt(rs.getString("COMMENT"));
+                    } else {
+                        version = 0;
+                    }
                 } catch(NumberFormatException e) {
                     version = 0;
                 } catch(SQLException e) {
-                    if(e.getMessage().contains("Column 'COMMENT' not found")) {
+                    String message = e.getMessage();
+                    if(message != null && message.contains("Column 'COMMENT' not found")) {
                         version = 0;
                     } else {
                         throw e;
@@ -90,10 +98,11 @@ public class MysqlMethod implements CacheMethod {
                             statement.executeUpdate("alter table `"+tableName+"` add column "+type+"_lasttotal BIGINT");
                             statement.executeUpdate("alter table `"+tableName+"` add column "+type+"_timestamp BIGINT");
                         } catch(SQLException e) {
-                            if(e.getMessage().contains("Duplicate")) {
+                            String message = e.getMessage();
+                            if(message != null && message.contains("Duplicate")) {
                                 plugin.getLogger().info("The columns already exist for "+tableName+". Canceling updater and bumping DB version.");
-                                try {
-                                    conn.createStatement().executeUpdate("ALTER TABLE `"+tableName+"` COMMENT = '1';");
+                                try (Statement stmt = conn.createStatement()) {
+                                    stmt.executeUpdate("ALTER TABLE `"+tableName+"` COMMENT = '1';");
                                 } catch (SQLException er) {
                                     er.printStackTrace();
                                     throw e;
@@ -113,10 +122,11 @@ public class MysqlMethod implements CacheMethod {
                     try {
                         statement.executeUpdate("alter table `"+tableName+"` add column displaynamecache TINYTEXT");
                     } catch(SQLException e) {
-                        if(e.getMessage().contains("Duplicate")) {
+                        String message = e.getMessage();
+                        if(message != null && message.contains("Duplicate")) {
                             plugin.getLogger().info("The columns already exist for "+tableName+". Canceling updater and bumping DB version.");
-                            try {
-                                conn.createStatement().executeUpdate("ALTER TABLE `"+tableName+"` COMMENT = '2';");
+                            try (Statement stmt = conn.createStatement()) {
+                                stmt.executeUpdate("ALTER TABLE `"+tableName+"` COMMENT = '2';");
                             } catch (SQLException er) {
                                 er.printStackTrace();
                                 throw e;
@@ -135,10 +145,11 @@ public class MysqlMethod implements CacheMethod {
                         statement.executeUpdate("alter table `"+tableName+"` add column "+type+"_lasttotal BIGINT");
                         statement.executeUpdate("alter table `"+tableName+"` add column "+type+"_timestamp BIGINT");
                     } catch(SQLException e) {
-                        if(e.getMessage().contains("Duplicate")) {
+                        String message = e.getMessage();
+                        if(message != null && message.contains("Duplicate")) {
                             plugin.getLogger().info("The columns already exist for "+tableName+". Canceling updater and bumping DB version.");
-                            try {
-                                conn.createStatement().executeUpdate("ALTER TABLE `"+tableName+"` COMMENT = '3';");
+                            try (Statement stmt = conn.createStatement()) {
+                                stmt.executeUpdate("ALTER TABLE `"+tableName+"` COMMENT = '3';");
                             } catch (SQLException er) {
                                 er.printStackTrace();
                                 throw e;
@@ -153,14 +164,34 @@ public class MysqlMethod implements CacheMethod {
                 if(version == 3) {
                     for (TimedType type : TimedType.values()) {
                         if(type == TimedType.ALLTIME) continue;
-                        try {
-                            conn.createStatement().executeUpdate("create index "+type.lowerName()+"_timestamp on `"+tableName+"` ("+type.lowerName()+"_timestamp)");
+                        try (Statement stmt = conn.createStatement()) {
+                            stmt.executeUpdate(
+                                    "create index "+type.lowerName()+"_timestamp on `"+tableName+"` ("+type.lowerName()+"_timestamp)"
+                            );
                         } catch(SQLException e) {
-                            if(!e.getMessage().contains("Duplicate key name")) throw e;
+                            String message = e.getMessage();
+                            if(message == null || !message.contains("Duplicate key name")) throw e;
                         }
                     }
                     statement.executeUpdate("ALTER TABLE `"+tableName+"` COMMENT = '4';");
                     version = 4;
+                }
+                if(version == 4) {
+                    for (TimedType type : TimedType.values()) {
+                        String index = type == TimedType.ALLTIME ? "value" : type.lowerName()+"_delta";
+                        try (Statement stmt = conn.createStatement()) {
+                            stmt.executeUpdate(
+                                    "create index " + index + " on `"+tableName+"` (" + index + ")"
+                            );
+                        } catch(SQLException e) {
+                            String message = e.getMessage();
+                            if((message == null || !message.contains("Duplicate key name")) && e.getErrorCode() != 1061) {
+                                throw e;
+                            }
+                        }
+                    }
+                    statement.executeUpdate("ALTER TABLE `"+tableName+"` COMMENT = '5';");
+                    version = 5;
                 }
             }
         } catch (SQLException e) {

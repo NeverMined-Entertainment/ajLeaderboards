@@ -50,7 +50,8 @@ if(!github?.event) {
     const versions = await fetch("https://ajg0702.us/pl/updater/mc-versions.php")
         .then(res => res.json());
 
-    const changes = github.event.commits;
+    const event = github.event;
+    const changes = event.commits;
 
     const version = await fs.readFile("build.gradle.kts", "utf8")
         .then(f => f.split("version = \"")[1].split('"')[0]);
@@ -72,20 +73,31 @@ if(!github?.event) {
         "version_number": `${version}`,
         "name": `Pre-release v${version}`,
         "changelog":
-`Note: This is a potentially unstable (and possibly untested) build. It is not guaranteed to work, and may have issues.<br>
-If you do decide to run this, make sure to report any issues to support.<br>
-<br>
-Changes in this build:<br>
-${changes.map(c => `<a href="${c.url}">${c.message}</a><br>`).join("")}
+            `
+<p>
+    Note: This is a potentially unstable (and possibly untested) build. It is not guaranteed to work, and may have issues.<br/>
+    If you do decide to run this, make sure to report any issues to support.
+</p>
 
-${changes.length > 1 ? `<br><a href="${github.event.compare}">View combined changes</a>` : ``}
-`,
+<p>
+    Changes in this build:
+    <ul>
+        ${changes.map(c => `<li><a href="${c.url}">${c.message}</a></li>`).join("\n")}
+    </ul>
+    ${changes.length > 1 ? `<a href="${event.compare}">View combined changes</a>` : ``}
+</p>
+`.trim(),
         "file_parts": ["file"],
         "version_type": "beta",
         "loaders": ["paper","spigot"],
         "featured": false,
         "game_versions": versions,
-        "dependencies": [],
+        "dependencies": [
+            {
+                project_id: "lKEzGugV",
+                dependency_type: "required"
+            }
+        ],
         "primary_file": "file"
     }));
     modrinthData.set("file", file)
@@ -114,33 +126,67 @@ ${changes.length > 1 ? `<br><a href="${github.event.compare}">View combined chan
 
     const polymartData = new FormData();
     polymartData.set("api_key", POLYMART_TOKEN);
-    polymartData.set("resource_id", "2726");
+    polymartData.set("product", "2726");
     polymartData.set("version", version);
-    polymartData.set("title", `Pre-release v${version}`);
-    polymartData.set("beta", "1");
-    polymartData.set("message",
-`Note: This is a potentially unstable (and possibly untested) build. It is not guaranteed to work, and may have issues.
-If you do decide to run this, make sure to report any issues to support.
+    polymartData.set("update_title", `Pre-release v${version}`);
+    polymartData.set("tag", "beta");
+    polymartData.set("update_description",
+        `
+<p>
+    Note: This is a potentially unstable (and possibly untested) build. It is not guaranteed to work, and may have issues.<br/>
+    If you do decide to run this, make sure to report any issues to support.
+</p>
 
-Changes in this build:
-${changes.map(c => `[url=${c.url}]${c.message}[/url]` + "\n").join()}
+<p>
+    Changes in this build:
+    <ul>
+        ${changes.map(c => `<li><a href="${c.url}">${c.message}</a></li>`).join("\n")}
+    </ul>
+    ${changes.length > 1 ? `<a href="${event.compare}">View combined changes</a>` : ``}
+</p>
+`.trim());
+    polymartData.set("file_name", file.name);
 
-${changes.length > 1 ? "\n" + `[url=${github.event.compare}]View combined changes[/url]` : ``}
-`);
-    polymartData.set("file", file);
-
-    const polymartResponse = await fetch("https://api.polymart.org/v1/postUpdate", {
+    const firstResponse = await fetch("https://api.polymart.org/v1/doPostUpdate", {
         method: "POST",
         headers: {
             "User-Agent": "ajUpdater/2.0",
         },
         body: polymartData
-    })
+    });
 
-    if(!polymartResponse.ok) {
-        console.warn("Polymart response failed.", await polymartResponse.text());
+    let uploadResponse: Response | undefined = undefined;
+
+    if(firstResponse.ok) {
+        const polymartResponseData = (await firstResponse.clone().json()).response;
+
+        console.info("Polymart first succeeded.", await firstResponse.text());
+
+        const uploadData = new FormData();
+        // for (let [k, v] of Object.entries(polymartResponseData.upload.fields)) {
+        //     uploadData.append(k, v as any);
+        // }
+        uploadData.append("file", file);
+
+        uploadResponse = await fetch(polymartResponseData.upload.url, {
+            method: "PUT",
+            headers: {
+                "User-Agent": "ajUpdater/2.0",
+                "enctype": "multipart/form-data"
+            },
+            body: uploadData
+        })
+    }
+
+    if(!firstResponse.ok) {
+        console.warn("Polymart first response failed.", await firstResponse.text());
     } else {
-        console.error("Polymart succeeded.", await polymartResponse.text())
+
+        if(!uploadResponse?.ok) {
+            console.warn("Polymart upload response failed.", await uploadResponse?.text())
+        } else {
+            console.info("Polymart upload succeeded.", await uploadResponse?.text())
+        }
     }
 
 

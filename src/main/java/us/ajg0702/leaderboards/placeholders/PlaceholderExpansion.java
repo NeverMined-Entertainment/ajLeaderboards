@@ -1,5 +1,6 @@
 package us.ajg0702.leaderboards.placeholders;
 
+import me.clip.placeholderapi.PlaceholderAPI;
 import org.bukkit.OfflinePlayer;
 import org.jetbrains.annotations.NotNull;
 import us.ajg0702.leaderboards.LeaderboardPlugin;
@@ -30,6 +31,7 @@ public class PlaceholderExpansion extends me.clip.placeholderapi.expansion.Place
         placeholders.add(new Extra(plugin));
         placeholders.add(new Name(plugin));
         placeholders.add(new Skin(plugin));
+        placeholders.add(new SkinUUID(plugin));
         placeholders.add(new UUID(plugin));
         placeholders.add(new Prefix(plugin));
         placeholders.add(new Suffix(plugin));
@@ -76,7 +78,13 @@ public class PlaceholderExpansion extends me.clip.placeholderapi.expansion.Place
     Map<String, CachedPlaceholder> placeholderCache = new ConcurrentHashMap<>();
 
     @Override
-    public String onRequest(OfflinePlayer p, @NotNull String params) {
+    public String onRequest(OfflinePlayer p, @NotNull String rawParams) {
+        String params;
+        if(plugin.getAConfig().getBoolean("parse-placeholders-in-placeholders")) {
+            params = PlaceholderAPI.setBracketPlaceholders(p, rawParams);
+        } else {
+            params = rawParams;
+        }
         CachedPlaceholder cachedPlaceholder = placeholderCache.computeIfAbsent(params, s -> {
             for(Placeholder placeholder : placeholders) {
                 Matcher matcher = placeholder.getPattern().matcher(params);

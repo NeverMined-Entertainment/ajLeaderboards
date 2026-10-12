@@ -56,7 +56,7 @@ public class HeadUtils {
 
         debug.infoW("Detected minor minecraft version: " + minorVersion);
 
-        if(minorVersion >= 19) {
+        if(VersionSupport.getMajorVersion() >= 26 || minorVersion >= 19) {
             try {
                 versionedHeadUtils = (VersionedHeadUtils) Class.forName("us.ajg0702.leaderboards.nms.nms19.HeadUtils19")
                         .getDeclaredConstructor(DebugWrapper.class, CompatScheduler.class, Logger.class)
@@ -76,10 +76,10 @@ public class HeadUtils {
     public ItemStack getHeadItem(UUID uuid, String name) {
 
         ItemStack skull = null;
-        if(VersionSupport.getMinorVersion() <= 12) {
+        if(VersionSupport.getMajorVersion() < 26 && VersionSupport.getMinorVersion() <= 12) {
             //noinspection deprecation
             skull = new ItemStack(Material.valueOf("SKULL_ITEM"), 1 , (short) 3);
-        } else if(VersionSupport.getMinorVersion() > 12) {
+        } else {
             skull = new ItemStack(Material.PLAYER_HEAD, 1);
         }
         String value;

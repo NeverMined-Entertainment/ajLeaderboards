@@ -7,7 +7,6 @@ import com.google.common.cache.RemovalCause;
 import com.google.common.util.concurrent.Futures;
 import com.google.common.util.concurrent.ListenableFuture;
 import com.google.common.util.concurrent.ListenableFutureTask;
-import org.bukkit.Bukkit;
 import org.bukkit.OfflinePlayer;
 import org.jetbrains.annotations.NotNull;
 import us.ajg0702.leaderboards.Debug;
@@ -22,6 +21,8 @@ import us.ajg0702.leaderboards.cache.methods.MysqlMethod;
 import us.ajg0702.leaderboards.nms.legacy.ThreadFactoryProxy;
 import us.ajg0702.leaderboards.utils.Cached;
 
+import java.lang.reflect.InvocationTargetException;
+import java.lang.reflect.Method;
 import java.util.*;
 import java.util.concurrent.*;
 import java.util.concurrent.atomic.AtomicInteger;
@@ -33,8 +34,12 @@ public class TopManager {
 
     private final AtomicInteger fetching = new AtomicInteger(0);
 
-    public void shutdown() {
-        fetchService.shutdownNow();
+    public void shutdown(boolean fast) {
+        fetchService.getQueue().clear(); // clear queue so we dont wait for all tasks in the queue to run
+        fetchService.shutdown();
+        try {
+            fetchService.awaitTermination(fast ? 2 : 15, TimeUnit.SECONDS);
+        } catch (InterruptedException ignored) {}
     }
 
     private static final String OUT_OF_THREADS_MESSAGE = "unable to create native thread: possibly out of memory or process/resource limits reached";
@@ -46,25 +51,42 @@ public class TopManager {
         CacheMethod method = plugin.getCache().getMethod();
         int t = method instanceof MysqlMethod ? Math.max(10, method.getMaxConnections()) : plugin.getAConfig().getInt("max-fetching-threads");
         int keepAlive = plugin.getAConfig().getInt("fetching-thread-pool-keep-alive");
+        ThreadFactory threadFactory;
+        try {
+            // Check if virtual thread methods exist (Java 21+)
+            Object builder = Thread.class.getMethod("ofVirtual").invoke(null);
+            Class<?> builderInterface = Class.forName("java.lang.Thread$Builder$OfVirtual");
+            builderInterface.getMethod("name", String.class, Long.TYPE)
+                    .invoke(builder, "AJLBFETCH", 0L);
+            threadFactory = (ThreadFactory) builderInterface.getMethod("factory")
+                    .invoke(builder);
+        } catch (NoSuchMethodException | IllegalAccessException | InvocationTargetException | ClassNotFoundException e) {
+            plugin.getLogger().info("Using old thread pool due to running on an older Java version! If possible, updating to Java 21+ is recommended.");
+            Debug.info(e.getClass().getName() + ": " + e.getMessage());
+            // Fallback to Java 11/17 logic
+            threadFactory = ThreadFactoryProxy.getDefaultThreadFactory("AJLBFETCH");
+        }
         fetchService = new ThreadPoolExecutor(
                 t, t,
                 keepAlive, TimeUnit.MILLISECONDS,
-                new ArrayBlockingQueue<>(1000000, true),
-                ThreadFactoryProxy.getDefaultThreadFactory("AJLBFETCH")
+                new LinkedBlockingQueue<>(1000000),
+                threadFactory
         );
         fetchService.allowCoreThreadTimeOut(true);
-        plugin.getScheduler().runTaskTimerAsynchronously(() -> {
+
+        plugin.getScheduledExecutorService().scheduleAtFixedRate(() -> {
+            if(plugin.isShuttingDown()) return;
             rolling.add(getQueuedTasks()+getActiveFetchers());
             if(rolling.size() > 50) {
                 rolling.remove(0);
             }
-        }, 0, 2);
+        }, 0, 100, TimeUnit.MILLISECONDS);
 
         boardCache = initialBoards;
     }
 
-    Map<PositionBoardType, Long> positionLastRefresh = new HashMap<>();
-    List<PositionBoardType> positionFetching = new CopyOnWriteArrayList<>();
+    Map<PositionBoardType, Long> positionLastRefresh = new ConcurrentHashMap<>();
+    Set<PositionBoardType> positionFetching = ConcurrentHashMap.newKeySet();
     LoadingCache<PositionBoardType, StatEntry> positionCache = CacheBuilder.newBuilder()
             .expireAfterAccess(1, TimeUnit.HOURS)
             .refreshAfterWrite(5, TimeUnit.SECONDS)
@@ -109,23 +131,23 @@ public class TopManager {
                 if (BlockingFetch.shouldBlock(plugin)) {
                     cached = positionCache.getUnchecked(key);
                 } else {
-                    if (!positionFetching.contains(key)) {
-                        if (plugin.getAConfig().getBoolean("fetching-de-bug")) Debug.info("Starting fetch on " + key);
-                        positionFetching.add(key);
-                        fetchService.submit(() -> {
-                            positionCache.getUnchecked(key);
-                            positionFetching.remove(key);
-                            if (plugin.getAConfig().getBoolean("fetching-de-bug"))
-                                Debug.info("Fetch finished on " + key);
-                        });
-                    }
+                if (positionFetching.add(key)) {
+                    if (plugin.isShuttingDown()) return StatEntry.loading(plugin, position, board, type);
+                    if (plugin.getAConfig().getBoolean("fetching-de-bug")) Debug.info("Starting fetch on " + key);
+                    fetchService.submit(() -> {
+                        positionCache.getUnchecked(key);
+                        positionFetching.remove(key);
+                        if (plugin.getAConfig().getBoolean("fetching-de-bug"))
+                            Debug.info("Fetch finished on " + key);
+                    });
+                }
                     if (plugin.getAConfig().getBoolean("fetching-de-bug")) Debug.info("Returning loading for " + key);
-                    cacheStatPosition(position, new BoardType(board, type), null);
                     return StatEntry.loading(plugin, position, board, type);
                 }
             }
         } catch(Exception e) {
-            if(e.getMessage().contains(OUT_OF_THREADS_MESSAGE)) {
+            String message = e.getMessage();
+            if(message != null && message.contains(OUT_OF_THREADS_MESSAGE)) {
                 informAboutThreadLimit();
                 return StatEntry.error(position, board, type);
             } else {
@@ -141,24 +163,53 @@ public class TopManager {
     public final Map<UUID, Map<BoardType, Integer>> positionPlayerCache = new ConcurrentHashMap<>();
 
     private void cacheStatPosition(int position, BoardType boardType, UUID playerUUID) {
-        for (Map.Entry<UUID, Map<BoardType, Integer>> entry : positionPlayerCache.entrySet()) {
-            if(entry.getKey().equals(playerUUID)) continue;
-            entry.getValue().remove(boardType, position);
-        }
-
         if(playerUUID == null) return;
 
-        Map<BoardType, Integer> newMap = positionPlayerCache.getOrDefault(playerUUID, new HashMap<>());
+        Integer oldPosition = positionPlayerCache.get(playerUUID) != null 
+            ? positionPlayerCache.get(playerUUID).get(boardType) 
+            : null;
+        
+        if(oldPosition != null) {
+            int minPos = Math.min(oldPosition, position);
+            int maxPos = Math.max(oldPosition, position);
+            
+            if(minPos != maxPos) {
+                positionPlayerCache.forEach((uuid, map) -> {
+                    if(!uuid.equals(playerUUID)) {
+                        Integer cachedPos = map.get(boardType);
+                        if(cachedPos != null && cachedPos >= minPos && cachedPos <= maxPos) {
+                            map.remove(boardType);
+                        }
+                    }
+                });
+            }
+        } else {
+            positionPlayerCache.forEach((uuid, map) -> {
+                if(!uuid.equals(playerUUID)) {
+                    map.remove(boardType, position);
+                }
+            });
+        }
 
-        newMap.put(boardType, position);
+        positionPlayerCache.compute(playerUUID, (uuid, existingMap) -> {
+            Map<BoardType, Integer> map = existingMap != null ? existingMap : new ConcurrentHashMap<>();
+            map.put(boardType, position);
+            return map;
+        });
 
-        positionPlayerCache.put(playerUUID, newMap);
+        if(positionPlayerCache.size() > 10000) {
+            Iterator<UUID> it = positionPlayerCache.keySet().iterator();
+            while(positionPlayerCache.size() > 10000 && it.hasNext()) {
+                it.next();
+                it.remove();
+            }
+        }
     }
 
-    Map<PlayerBoardType, Long> statEntryLastRefresh = new HashMap<>();
+    Map<PlayerBoardType, Long> statEntryLastRefresh = new ConcurrentHashMap<>();
     LoadingCache<PlayerBoardType, StatEntry> statEntryCache = CacheBuilder.newBuilder()
             .expireAfterAccess(1, TimeUnit.HOURS)
-            .refreshAfterWrite(1, TimeUnit.SECONDS)
+            .refreshAfterWrite(5, TimeUnit.SECONDS)
             .maximumSize(10000)
             .removalListener(notification -> {
                 if(!notification.getCause().equals(RemovalCause.REPLACED)) statEntryLastRefresh.remove((PlayerBoardType) notification.getKey());
@@ -203,6 +254,7 @@ public class TopManager {
                 if (BlockingFetch.shouldBlock(plugin)) {
                     cached = statEntryCache.getUnchecked(key);
                 } else {
+                    if (plugin.isShuttingDown()) return StatEntry.loading(player, key.getBoardType());
                     fetchService.submit(() -> statEntryCache.getUnchecked(key));
                     return StatEntry.loading(player, key.getBoardType());
                 }
@@ -210,7 +262,8 @@ public class TopManager {
 
             return cached;
         } catch(Exception e) {
-            if(e.getMessage().contains(OUT_OF_THREADS_MESSAGE)) {
+            String message = e.getMessage();
+            if(message != null && message.contains(OUT_OF_THREADS_MESSAGE)) {
                 informAboutThreadLimit();
                 return StatEntry.error(-4, board, type);
             } else {
@@ -229,10 +282,12 @@ public class TopManager {
         try {
             r = statEntryCache.getIfPresent(key);
             if(fetchIfAbsent && r == null) {
+                if (plugin.isShuttingDown()) return null;
                 fetchService.submit(() -> statEntryCache.getUnchecked(key));
             }
         } catch(Exception e) {
-            if(e.getMessage().contains(OUT_OF_THREADS_MESSAGE)) {
+            String message = e.getMessage();
+            if(message != null && message.contains(OUT_OF_THREADS_MESSAGE)) {
                 informAboutThreadLimit();
                 return StatEntry.error(-4, board, type);
             } else {
@@ -250,10 +305,12 @@ public class TopManager {
         try {
             r = positionCache.getIfPresent(positionBoardType);
             if (r == null && fetchIfAbsent) {
+                if (plugin.isShuttingDown()) return null;
                 fetchService.submit(() -> positionCache.getUnchecked(positionBoardType));
             }
         } catch(Exception e) {
-            if(e.getMessage().contains(OUT_OF_THREADS_MESSAGE)) {
+            String message = e.getMessage();
+            if(message != null && message.contains(OUT_OF_THREADS_MESSAGE)) {
                 informAboutThreadLimit();
                 return StatEntry.error(positionBoardType.getPosition(), positionBoardType.getBoard(), positionBoardType.getType());
             } else {
@@ -264,10 +321,10 @@ public class TopManager {
     }
 
 
-    Map<String, Long> boardSizeLastRefresh = new HashMap<>();
+    Map<String, Long> boardSizeLastRefresh = new ConcurrentHashMap<>();
     LoadingCache<String, Integer> boardSizeCache = CacheBuilder.newBuilder()
             .expireAfterAccess(24, TimeUnit.HOURS)
-            .refreshAfterWrite(1, TimeUnit.SECONDS)
+            .refreshAfterWrite(15, TimeUnit.SECONDS)
             .maximumSize(10000)
             .removalListener(notification -> {
                 if(!notification.getCause().equals(RemovalCause.REPLACED)) boardSizeLastRefresh.remove((String) notification.getKey());
@@ -308,6 +365,7 @@ public class TopManager {
                 if (BlockingFetch.shouldBlock(plugin)) {
                     cached = boardSizeCache.getUnchecked(board);
                 } else {
+                    if (plugin.isShuttingDown()) return -2;
                     fetchService.submit(() -> boardSizeCache.getUnchecked(board));
                     return -2;
                 }
@@ -315,7 +373,8 @@ public class TopManager {
 
             return cached;
         } catch(Exception e) {
-            if(e.getMessage().contains(OUT_OF_THREADS_MESSAGE)) {
+            String message = e.getMessage();
+            if(message != null && message.contains(OUT_OF_THREADS_MESSAGE)) {
                 informAboutThreadLimit();
                 return -4;
             } else {
@@ -325,10 +384,10 @@ public class TopManager {
 
     }
 
-    Map<BoardType, Long> totalLastRefresh = new HashMap<>();
+    Map<BoardType, Long> totalLastRefresh = new ConcurrentHashMap<>();
     LoadingCache<BoardType, Double> totalCache = CacheBuilder.newBuilder()
             .expireAfterAccess(24, TimeUnit.HOURS)
-            .refreshAfterWrite(1, TimeUnit.SECONDS)
+            .refreshAfterWrite(15, TimeUnit.SECONDS)
             .maximumSize(10000)
             .removalListener(notification -> {
                 if(!notification.getCause().equals(RemovalCause.REPLACED)) totalLastRefresh.remove((BoardType) notification.getKey());
@@ -371,6 +430,7 @@ public class TopManager {
                 if (BlockingFetch.shouldBlock(plugin)) {
                     cached = totalCache.getUnchecked(boardType);
                 } else {
+                    if (plugin.isShuttingDown()) return -2;
                     fetchService.submit(() -> totalCache.getUnchecked(boardType));
                     return -2;
                 }
@@ -378,7 +438,8 @@ public class TopManager {
 
             return cached;
         } catch(Exception e) {
-            if(e.getMessage().contains(OUT_OF_THREADS_MESSAGE)) {
+            String message = e.getMessage();
+            if(message != null && message.contains(OUT_OF_THREADS_MESSAGE)) {
                 informAboutThreadLimit();
                 return -4;
             } else {
@@ -411,12 +472,13 @@ public class TopManager {
     }
 
     public void fetchBoardsAsync() {
+        if (plugin.isShuttingDown()) return;
         checkWrong();
         fetchService.submit(this::fetchBoards);
     }
     public List<String> fetchBoards() {
         int f = fetching.getAndIncrement();
-        if(plugin.getAConfig().getBoolean("fetching-de-bug")) Debug.info("Fetching ("+fetchService.getPoolSize()+") (boards): "+f);
+        if(plugin.getAConfig().getBoolean("fetching-de-bug")) Debug.info("Fetching (boards): "+f);
         boardCache = plugin.getCache().getBoards();
         if(plugin.getAConfig().getBoolean("fetching-de-bug")) Debug.info("Finished fetching boards");
         removeFetching();
@@ -434,7 +496,7 @@ public class TopManager {
 
     public int getFetchingAverage() {
         List<Integer> snap = new ArrayList<>(rolling);
-        if(snap.size() == 0) return 0;
+        if(snap.isEmpty()) return 0;
         int sum = 0;
         for(Integer n : snap) {
             if(n == null) break;
@@ -469,42 +531,54 @@ public class TopManager {
     }
 
 
-    Map<ExtraKey, Cached<String>> extraCache = new HashMap<>();
+    Map<ExtraKey, Long> extraLastRefresh = new ConcurrentHashMap<>();
+    LoadingCache<ExtraKey, String> extraCache = CacheBuilder.newBuilder()
+            .expireAfterAccess(30, TimeUnit.MINUTES)
+            .maximumSize(10_000)
+            .build(new CacheLoader<ExtraKey, String>() {
+                @Override
+                public String load(ExtraKey key) {
+                    return plugin.getExtraManager().getExtra(key.getId(), key.getPlaceholder());
+                }
+            });
     public String getExtra(UUID id, String placeholder) {
         ExtraKey key = new ExtraKey(id, placeholder);
-        Cached<String> cached = extraCache.get(key);
+        String cached = extraCache.getIfPresent(key);
         if(cached == null) {
             if(BlockingFetch.shouldBlock(plugin)) {
                 return fetchExtra(id, placeholder);
             } else {
-                extraCache.put(key, new Cached<>(System.currentTimeMillis(), plugin.getMessages().getRawString("loading.text")));
+                extraCache.put(key, plugin.getMessages().getRawString("loading.text"));
                 fetchExtraAsync(id, placeholder);
                 return plugin.getMessages().getRawString("loading.text");
             }
         } else {
-            if(System.currentTimeMillis() - cached.getLastGet() > cacheTime()) {
-                cached.setLastGet(System.currentTimeMillis());
+            long lastRefresh = extraLastRefresh.getOrDefault(key, 0L);
+            if(System.currentTimeMillis() - lastRefresh > cacheTime()) {
+                extraLastRefresh.put(key, System.currentTimeMillis());
                 fetchExtraAsync(id, placeholder);
             }
-            return cached.getThing();
+            return cached;
         }
     }
     public String fetchExtra(UUID id, String placeholder) {
+        ExtraKey key = new ExtraKey(id, placeholder);
         String value = plugin.getExtraManager().getExtra(id, placeholder);
-        extraCache.put(new ExtraKey(id, placeholder), new Cached<>(System.currentTimeMillis(), value));
+        extraCache.put(key, value);
         return value;
     }
     public void fetchExtraAsync(UUID id, String placeholder) {
+        if (plugin.isShuttingDown()) return;
         fetchService.submit(() -> fetchExtra(id, placeholder));
     }
 
     public String getCachedExtra(UUID id, String placeholder) {
-        Cached<String> r = extraCache.get(new ExtraKey(id, placeholder));
+        String r = extraCache.getIfPresent(new ExtraKey(id, placeholder));
         if(r == null) {
             fetchExtraAsync(id, placeholder);
             return null;
         }
-        return r.getThing();
+        return r;
     }
 
     public StatEntry getRelative(OfflinePlayer player, int difference, String board, TimedType type) {
@@ -537,7 +611,7 @@ public class TopManager {
         boolean moreFetching = plugin.getAConfig().getBoolean("more-fetching");
 
 
-        int r = moreFetching ? (recentLargeAverage ? 5000 : 1000) : 20000;
+        int r = moreFetching ? (recentLargeAverage ? 5_000 : 1_000) : 20_000;
 
         int fetchingAverage = getFetchingAverage();
 
@@ -554,39 +628,39 @@ public class TopManager {
                     return 500;
                 }
                 if(fetchingAverage > 0) {
-                    r = 2000;
+                    r = 2_000;
                 }
                 if(fetchingAverage >= 2) {
-                    r = 5000;
+                    r = 5_000;
                 }
             }
-            if((fetchingAverage >= 5 || totalTasks > 25) && activeFetchers > 0) {
-                r = 10000;
+            if((fetchingAverage >= 3 || totalTasks > 10) && activeFetchers > 0) {
+                r = 10_000;
             }
-            if((fetchingAverage > 10 || totalTasks > 59) && activeFetchers > 0) {
-                r = 15000;
+            if((fetchingAverage > 5 || totalTasks > 15) && activeFetchers > 0) {
+                r = 15_000;
             }
         }
-        if((fetchingAverage > 20 || totalTasks > 75) && activeFetchers > 0) {
-            r = 30000;
+        if((fetchingAverage > 7 || totalTasks > 20) && activeFetchers > 0) {
+            r = 30_000;
         }
-        if((fetchingAverage > 30 || totalTasks > 100) && activeFetchers > 0) {
-            r = 60000;
+        if((fetchingAverage > 10 || totalTasks > 25) && activeFetchers > 0) {
+            r = 60_000;
         }
-        if(fetchingAverage > 50 || totalTasks > 125) {
+        if(fetchingAverage > 20 || totalTasks > 30) {
             lastLargeAverage = System.currentTimeMillis();
             if(activeFetchers > 0) {
-                r = 120000;
+                r = 120_000;
             }
         }
+        if((fetchingAverage > 35 || totalTasks > 50) && activeFetchers > 0) {
+            r = 180_000;
+        }
+        if((fetchingAverage > 50 || totalTasks > 75) && activeFetchers > 0) {
+            r = 3_600_000; // 1 hour
+        }
         if((fetchingAverage > 100 || totalTasks > 150) && activeFetchers > 0) {
-            r = 180000;
-        }
-        if((fetchingAverage > 300 || totalTasks > 175) && activeFetchers > 0) {
-            r = 3600000;
-        }
-        if((fetchingAverage > 400 || totalTasks > 200) && activeFetchers > 0) {
-            r = 7200000;
+            r = 7_200_000; // 2 hours
         }
 
 
@@ -623,6 +697,7 @@ public class TopManager {
 
     @SuppressWarnings("UnusedReturnValue")
     public Future<?> submit(Runnable task) {
+        if (plugin.isShuttingDown()) return null;
         return fetchService.submit(task);
     }
 

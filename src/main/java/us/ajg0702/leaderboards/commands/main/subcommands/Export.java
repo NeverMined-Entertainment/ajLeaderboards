@@ -49,9 +49,9 @@ public class Export extends SubCommand {
             }
 
             try {
-                Writer writer = new FileWriter(file);
-                new Gson().toJson(obj, writer);
-                writer.close();
+                try (Writer writer = new FileWriter(file)) {
+                    new Gson().toJson(obj, writer);
+                }
             } catch (IOException e) {
                 plugin.getLogger().log(Level.SEVERE, "An error occurred while writing:", e);
                 sender.sendMessage(plugin.getMessages().getComponent("commands.export.fail"));

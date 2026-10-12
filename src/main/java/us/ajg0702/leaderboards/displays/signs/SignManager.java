@@ -4,6 +4,7 @@ import net.kyori.adventure.text.Component;
 import net.kyori.adventure.text.serializer.legacy.LegacyComponentSerializer;
 import org.bukkit.Bukkit;
 import org.bukkit.Location;
+import org.bukkit.World;
 import org.bukkit.configuration.file.YamlConfiguration;
 import us.ajg0702.leaderboards.Debug;
 import us.ajg0702.leaderboards.LeaderboardPlugin;
@@ -17,6 +18,7 @@ import java.io.File;
 import java.io.IOException;
 import java.util.*;
 import java.util.List;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import java.util.concurrent.ExecutionException;
 import java.util.concurrent.TimeoutException;
@@ -50,7 +52,7 @@ public class SignManager {
         cfgFile = new File(plugin.getDataFolder(), "displays.yml");
         cfg = YamlConfiguration.loadConfiguration(cfgFile);
         String headerText = "This file is for storing sign location, npcs, and other things in the plugin that might display data";
-        if(VersionSupport.getMinorVersion() > 18) {
+        if(VersionSupport.getMajorVersion() >= 26 || VersionSupport.getMinorVersion() > 18) {
             cfg.options().setHeader(Collections.singletonList(headerText));
         } else {
             //noinspection deprecation
@@ -152,10 +154,10 @@ public class SignManager {
         }
     }
 
-    final HashMap<String, String> names = new HashMap<>();
+    final ConcurrentHashMap<String, String> names = new ConcurrentHashMap<>();
     public void updateNameCache() {
-        List<String> namesraw = plugin.getAConfig().getStringList("value-names");
-        for(String s : namesraw) {
+        List<String> namesRaw = plugin.getAConfig().getStringList("value-names");
+        for(String s : namesRaw) {
             if(!s.contains("%")) continue;
             String[] parts = s.split("%");
             names.put(parts[0], parts[1]);
@@ -227,7 +229,9 @@ public class SignManager {
     }
 
     public boolean isSignChunkLoaded(BoardSign sign) {
-        return sign.getWorld().isChunkLoaded(sign.getX(), sign.getZ());
+        World world = sign.getWorld();
+        if(world == null) return false;
+        return world.isChunkLoaded(sign.getX(), sign.getZ());
     }
 
 }

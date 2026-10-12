@@ -1,12 +1,12 @@
 plugins {
     java
     `maven-publish`
-    id("com.github.johnrengelman.shadow").version("6.1.0")
+    id("com.gradleup.shadow").version("8.3.9")
     id("io.github.slimjar").version("1.3.0")
 }
 
 group = "us.ajg0702"
-version = "2.10.1"
+version = "2.11.0"
 
 repositories {
     mavenCentral()
@@ -35,11 +35,11 @@ dependencies {
     compileOnly("org.xerial:sqlite-jdbc:3.32.3.2")
     compileOnly("org.spongepowered:configurate-yaml:4.0.0")
 
-    implementation("net.kyori:adventure-api:4.12.0")
-    implementation("net.kyori:adventure-text-minimessage:4.12.0")
-    implementation("net.kyori:adventure-platform-bukkit:4.3.3")
+    implementation("net.kyori:adventure-api:4.26.1")
+    implementation("net.kyori:adventure-text-minimessage:4.26.1")
+    implementation("net.kyori:adventure-platform-bukkit:4.4.1")
 
-    implementation("us.ajg0702:ajUtils:1.2.29")
+    implementation("us.ajg0702:ajUtils:1.2.38")
     implementation("us.ajg0702.commands.platforms.bukkit:bukkit:1.0.0")
     implementation("us.ajg0702.commands.api:api:1.0.0")
 
@@ -53,7 +53,7 @@ dependencies {
 
     slim("com.zaxxer:HikariCP:3.4.5")
     slim("com.h2database:h2:2.1.214")
-    slim("com.squareup.okhttp3:okhttp:4.11.0")
+    slim("com.squareup.okhttp3:okhttp:4.12.0")
     //implementation("io.prometheus", "simpleclient", "0.9.0")
 }
 
@@ -74,6 +74,12 @@ tasks.withType<ProcessResources> {
 }
 
 tasks.slimJar {
+    mirror("https://repo-mirror.ajg0702.us/mirror", "https://repo.papermc.io/repository/maven-public/")
+    mirror("https://repo-mirror.ajg0702.us/mirror", "https://repo.maven.apache.org/maven2/")
+    mirror("https://repo-mirror.ajg0702.us/mirror", "https://repo1.maven.org/maven2/")
+    mirror("https://repo-mirror.ajg0702.us/mirror", "https://oss.sonatype.org/content/groups/public/")
+    mirror("https://repo-mirror.ajg0702.us/mirror", "https://repo.vshnv.tech/")
+
     relocate("org.h2", "us.ajg0702.leaderboards.libs.h2")
     relocate("com.zaxxer.hikari", "us.ajg0702.leaderboards.libs.hikari")
     relocate("com.squareup", "us.ajg0702.leaderboards.libs")

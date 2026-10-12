@@ -1,7 +1,6 @@
 package us.ajg0702.leaderboards.cache;
 
 import com.google.common.collect.ImmutableMap;
-import us.ajg0702.leaderboards.Debug;
 import us.ajg0702.leaderboards.LeaderboardPlugin;
 import us.ajg0702.leaderboards.boards.StatEntry;
 import us.ajg0702.leaderboards.cache.methods.H2Method;
@@ -42,56 +41,48 @@ public class ExtraManager {
         this.method = cache.getMethod();
         tableName = cache.getTablePrefix()+"extras";
 
-        try {
-            Connection conn = method.getConnection();
-            PreparedStatement ps = conn.prepareStatement(method.formatStatement(String.format(
-                    Objects.requireNonNull(CREATE_TABLE.get(method.getName())),
-                    tableName
-            )));
-
+        try (Connection conn = method.getConnection();
+             PreparedStatement ps = conn.prepareStatement(method.formatStatement(String.format(
+                     Objects.requireNonNull(CREATE_TABLE.get(method.getName())),
+                     tableName
+             )))) {
             ps.executeUpdate();
-
-            ps.close();
-            method.close(conn);
         } catch(SQLException e) {
             plugin.getLogger().log(Level.SEVERE, "Failed to create storage for Extras:", e);
         }
     }
 
     public String getExtra(UUID id, String placeholder) {
-        try {
-            Connection conn = method.getConnection();
-            PreparedStatement ps = conn.prepareStatement(method.formatStatement(String.format(
-                    Objects.requireNonNull(QUERY_IDVALUE),
-                    tableName
-            )));
+        try (Connection conn = method.getConnection();
+             PreparedStatement ps = conn.prepareStatement(method.formatStatement(String.format(
+                     Objects.requireNonNull(QUERY_IDVALUE),
+                     tableName
+             )))) {
 
             ps.setString(1, id.toString());
             ps.setString(2, placeholder);
 
-            ResultSet rs = ps.executeQuery();
-
-            if(method instanceof MysqlMethod || method instanceof H2Method) {
-                rs.next();
-            }
-
-            String value = null;
-            try {
-                value = rs.getString(2);
-            } catch(SQLException e) {
-                if(
-                        !e.getMessage().contains("ResultSet closed") &&
-                                !e.getMessage().contains("empty result set") &&
-                                !e.getMessage().contains("[2000-")
-                ) {
-                    throw e;
+            try (ResultSet rs = ps.executeQuery()) {
+                if(method instanceof MysqlMethod || method instanceof H2Method) {
+                    rs.next();
                 }
-            }
 
-            rs.close();
-            ps.close();
-            method.close(conn);
-            return value;
+                String value = null;
+                try {
+                    value = rs.getString(2);
+                } catch(SQLException e) {
+                    String message = e.getMessage();
+                    if(!(message != null && (
+                            message.contains("ResultSet closed") ||
+                                    message.contains("empty result set") ||
+                                    message.contains("[2000-")
+                    ))) {
+                        throw e;
+                    }
+                }
+
+                return value;
+            }
         } catch (SQLException e) {
             plugin.getLogger().log(Level.WARNING, "An error occurred while fetching an extra:", e);
             return StatEntry.AN_ERROR_OCCURRED;
@@ -113,33 +104,29 @@ public class ExtraManager {
 
     public void setExtra(UUID id, String placeholder, String value) {
         if(plugin.isShuttingDown()) return;
-        try {
-            Connection conn = method.getConnection();
-
-            PreparedStatement statement = conn.prepareStatement(String.format(
-                    method.formatStatement(UPDATE_PLAYER),
-                    tableName
-            ));
+        try (Connection conn = method.getConnection();
+             PreparedStatement statement = conn.prepareStatement(String.format(
+                     method.formatStatement(UPDATE_PLAYER),
+                     tableName
+             ))) {
             statement.setString(1, value);
             statement.setString(2, id.toString());
             statement.setString(3, placeholder);
 
             int rowsChanged = statement.executeUpdate();
-            statement.close();
             if(rowsChanged == 0) {
-                PreparedStatement insertStmt = conn.prepareStatement(String.format(
+                try (PreparedStatement insertStmt = conn.prepareStatement(String.format(
                         method.formatStatement(INSERT_PLAYER),
                         tableName
-                ));
+                ))) {
 
-                insertStmt.setString(1, id.toString());
-                insertStmt.setString(2, placeholder);
-                insertStmt.setString(3, value);
+                    insertStmt.setString(1, id.toString());
+                    insertStmt.setString(2, placeholder);
+                    insertStmt.setString(3, value);
 
-                insertStmt.executeUpdate();
-                insertStmt.close();
+                    insertStmt.executeUpdate();
+                }
             }
-            method.close(conn);
         } catch(SQLException e) {
             plugin.getLogger().log(Level.WARNING, "An error occurred while inserting an extra:", e);
         }

@@ -29,7 +29,7 @@ public class ArmorStandManager {
         this.plugin = plugin;
     }
 
-    private final HashMap<Location, ArmorStandCache> armorStandCache = new HashMap<>();
+    private final ConcurrentHashMap<Location, ArmorStandCache> armorStandCache = new ConcurrentHashMap<>();
 
     private void checkArmorstand(BoardSign sign, Location loc, String name, UUID id) throws ExecutionException, InterruptedException, TimeoutException {
         ArmorStandCache cache = armorStandCache.get(sign.getLocation());
@@ -67,7 +67,7 @@ public class ArmorStandManager {
         }
 
         Runnable runnable = () -> {
-            if(VersionSupport.getMinorVersion() >= 10) {
+            if(VersionSupport.getMajorVersion() >= 26 || VersionSupport.getMinorVersion() >= 10) {
                 stand.setSilent(true);
             }
             //noinspection deprecation
@@ -88,7 +88,7 @@ public class ArmorStandManager {
             Sign ss = sign.getSign();
             if(ss == null) return;
             BlockFace face;
-            if(VersionSupport.getMinorVersion() > 12) {
+            if(VersionSupport.minorVersionEqualGreaterThan(13)) {
                 BlockData bd = ss.getBlockData();
                 if(bd instanceof org.bukkit.block.data.type.Sign) {
                     org.bukkit.block.data.type.Sign bs = (org.bukkit.block.data.type.Sign) bd;
