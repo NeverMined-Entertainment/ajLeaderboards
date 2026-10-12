@@ -114,7 +114,7 @@ public class Time extends Format {
 
     @Override
     public String toFormat(double input) {
-        return TimeUtils.formatTimeSeconds(Math.round(input), withSeconds(), withWeeks());
+        return TimeUtils.formatTimeSeconds(Math.round(input), withSeconds());
     }
 
     @Override
@@ -125,9 +125,5 @@ public class Time extends Format {
     private boolean withSeconds() {
         if(plugin == null) return true;
         return plugin.getAConfig().getBoolean("time-format-display-seconds");
-    }
-    private boolean withWeeks() {
-        if(plugin == null) return true;
-        return plugin.getAConfig().getBoolean("time-format-display-weeks");
     }
 }
